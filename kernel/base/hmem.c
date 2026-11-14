@@ -15,6 +15,7 @@ typedef struct
     int using;
     enum hook_type type;
     uintptr_t addr;
+    volatile int cleanup_debt;
     // must align 8
     union
     {
@@ -44,6 +45,7 @@ void *hook_mem_zalloc(uintptr_t origin_addr, enum hook_type type)
         wrap->using = 1;
         wrap->addr = origin_addr;
         wrap->type = type;
+        wrap->cleanup_debt = 0;
 
         for (uintptr_t i = (uintptr_t)&wrap->chain; i < (uintptr_t)&wrap->chain + sizeof(wrap->chain); i += 8) {
             *(uint64_t *)i = 0;
@@ -75,4 +77,21 @@ void *hook_get_mem_from_origin(uint64_t origin_addr)
         }
     }
     return 0;
+}
+
+enum hook_type hook_get_mem_type(void *hook_mem)
+{
+    hook_mem_warp_t *warp;
+    if (!hook_mem) return NONE;
+    warp = local_container_of(hook_mem, hook_mem_warp_t, chain);
+    return warp->using ? warp->type : NONE;
+}
+
+void hook_mem_mark_cleanup_debt(void *hook_mem)
+{
+    hook_mem_warp_t *warp;
+    if (!hook_mem) return;
+    warp = local_container_of(hook_mem, hook_mem_warp_t, chain);
+    if (!__atomic_exchange_n(&warp->cleanup_debt, 1, __ATOMIC_ACQ_REL))
+        __atomic_add_fetch(&hook_deferred_debt, 1, __ATOMIC_ACQ_REL);
 }

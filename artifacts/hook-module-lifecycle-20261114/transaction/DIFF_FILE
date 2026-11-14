@@ -1,0 +1,3631 @@
+diff --git a/kernel/base/fphook.c b/kernel/base/fphook.c
+index 5c37ca3395359f076230c978f0db23413b538aa6..0919bffa4d250b985e8653d447349eafca9cd29a 100644
+--- a/kernel/base/fphook.c
++++ b/kernel/base/fphook.c
+@@ -9,6 +9,74 @@
+ #include <cache.h>
+ #include "hmem.h"
+ 
++static volatile int32_t fp_hook_guard;
++
++static void fp_hook_lock(void)
++{
++    while (__atomic_exchange_n(&fp_hook_guard, 1, __ATOMIC_ACQUIRE))
++        asm volatile("yield" ::: "memory");
++}
++
++static void fp_hook_unlock(void)
++{
++    __atomic_store_n(&fp_hook_guard, 0, __ATOMIC_RELEASE);
++}
++
++static inline __attribute__((always_inline)) int32_t
++fp_transit_reader_inc(volatile int32_t *reader)
++{
++    int32_t value;
++    uint32_t status;
++    asm volatile(
++        "1: ldaxr %w[value], [%[reader]]\n"
++        "add %w[value], %w[value], #1\n"
++        "stlxr %w[status], %w[value], [%[reader]]\n"
++        "cbnz %w[status], 1b\n"
++        : [value] "=&r"(value), [status] "=&r"(status)
++        : [reader] "r"(reader)
++        : "memory");
++    return value;
++}
++
++static inline __attribute__((always_inline)) int
++fp_chain_snapshot_items(fp_hook_chain_t *chain,
++                        uint8_t retained[FP_HOOK_CHAIN_NUM])
++{
++    int max = __atomic_load_n(&chain->chain_items_max, __ATOMIC_ACQUIRE);
++    if (max < 0) max = 0;
++    if (max > FP_HOOK_CHAIN_NUM) max = FP_HOOK_CHAIN_NUM;
++    for (int i = 0; i < FP_HOOK_CHAIN_NUM; i++) retained[i] = 0;
++    for (int i = 0; i < max; i++) {
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
++            CHAIN_ITEM_STATE_READY)
++            continue;
++        fp_transit_reader_inc(&chain->readers[i]);
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) ==
++            CHAIN_ITEM_STATE_READY) {
++            retained[i] = 1;
++        } else {
++            hook_item_reader_release(
++                &chain->states[i], &chain->readers[i],
++                &chain->debt_counted[i], chain->debt_ptr,
++                &chain->udata[i], &chain->befores[i], &chain->afters[i]);
++        }
++    }
++    return max;
++}
++
++static inline __attribute__((always_inline)) void
++fp_chain_release_items(fp_hook_chain_t *chain,
++                       const uint8_t retained[FP_HOOK_CHAIN_NUM], int max)
++{
++    for (int i = 0; i < max; i++) {
++        if (!retained[i]) continue;
++        hook_item_reader_release(
++            &chain->states[i], &chain->readers[i],
++            &chain->debt_counted[i], chain->debt_ptr,
++            &chain->udata[i], &chain->befores[i], &chain->afters[i]);
++    }
++}
++
+ // transit0
+ typedef uint64_t (*transit0_func_t)();
+ 
+@@ -21,11 +89,13 @@ uint64_t __attribute__((section(".fp.transit0.text"))) __attribute__((__noinline
+     };
+     vptr--;
+     fp_hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, fp_hook_chain_t, transit);
++    uint8_t retained[FP_HOOK_CHAIN_NUM];
++    int retained_max = fp_chain_snapshot_items(hook_chain, retained);
+     hook_fargs0_t fargs;
+     fargs.skip_origin = 0;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain0_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -33,11 +103,12 @@ uint64_t __attribute__((section(".fp.transit0.text"))) __attribute__((__noinline
+         transit0_func_t origin_func = (transit0_func_t)hook_chain->hook.origin_fp;
+         fargs.ret = origin_func();
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain0_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    fp_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ extern void _fp_transit0_end();
+@@ -55,6 +126,8 @@ _fp_transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+     };
+     vptr--;
+     fp_hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, fp_hook_chain_t, transit);
++    uint8_t retained[FP_HOOK_CHAIN_NUM];
++    int retained_max = fp_chain_snapshot_items(hook_chain, retained);
+     hook_fargs4_t fargs;
+     fargs.skip_origin = 0;
+     fargs.arg0 = arg0;
+@@ -62,8 +135,8 @@ _fp_transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+     fargs.arg2 = arg2;
+     fargs.arg3 = arg3;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain4_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -71,11 +144,12 @@ _fp_transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+         transit4_func_t origin_func = (transit4_func_t)hook_chain->hook.origin_fp;
+         fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3);
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain4_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    fp_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ 
+@@ -95,6 +169,8 @@ _fp_transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_
+     };
+     vptr--;
+     fp_hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, fp_hook_chain_t, transit);
++    uint8_t retained[FP_HOOK_CHAIN_NUM];
++    int retained_max = fp_chain_snapshot_items(hook_chain, retained);
+     hook_fargs8_t fargs;
+     fargs.skip_origin = 0;
+     fargs.arg0 = arg0;
+@@ -106,8 +182,8 @@ _fp_transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_
+     fargs.arg6 = arg6;
+     fargs.arg7 = arg7;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain8_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -116,11 +192,12 @@ _fp_transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_
+         fargs.ret =
+             origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6, fargs.arg7);
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain8_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    fp_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ 
+@@ -141,6 +218,8 @@ _fp_transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64
+     };
+     vptr--;
+     fp_hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, fp_hook_chain_t, transit);
++    uint8_t retained[FP_HOOK_CHAIN_NUM];
++    int retained_max = fp_chain_snapshot_items(hook_chain, retained);
+     hook_fargs12_t fargs;
+     fargs.skip_origin = 0;
+     fargs.arg0 = arg0;
+@@ -156,8 +235,8 @@ _fp_transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64
+     fargs.arg10 = arg10;
+     fargs.arg11 = arg11;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain12_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -166,11 +245,12 @@ _fp_transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64
+         fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6,
+                                 fargs.arg7, fargs.arg8, fargs.arg9, fargs.arg10, fargs.arg11);
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain12_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    fp_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ 
+@@ -207,7 +287,7 @@ static hook_err_t hook_chain_prepare(uint32_t *transit, int32_t argno)
+     int32_t transit_num = (transit_end - transit_start) / 4;
+ 
+     // todo: assert
+-    if (transit_num >= TRANSIT_INST_NUM) return -HOOK_TRANSIT_NO_MEM;
++    if (transit_num > TRANSIT_INST_NUM - 2) return -HOOK_TRANSIT_NO_MEM;
+ 
+     transit[0] = ARM64_BTI_JC;
+     transit[1] = ARM64_NOP;
+@@ -219,6 +299,10 @@ static hook_err_t hook_chain_prepare(uint32_t *transit, int32_t argno)
+ 
+ void fp_hook(uintptr_t fp_addr, void *replace, void **backup)
+ {
++    if (!hook_management_context_ok()) {
++        logke("Function-pointer hook rejected outside process context\n");
++        return;
++    }
+     uint64_t *entry = pgtable_entry_kernel(fp_addr);
+     uint64_t ori_prot = *entry;
+     modify_entry_kernel(fp_addr, entry, (ori_prot | PTE_DBM) & ~PTE_RDONLY);
+@@ -230,8 +314,10 @@ void fp_hook(uintptr_t fp_addr, void *replace, void **backup)
+ }
+ KP_EXPORT_SYMBOL(fp_hook);
+ 
+-void fp_unhook(uintptr_t fp_addr, void *backup)
++hook_err_t fp_unhook_checked(uintptr_t fp_addr, void *backup)
+ {
++    hook_err_t rc;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+     uint64_t *entry = pgtable_entry_kernel(fp_addr);
+     uint64_t ori_prot = *entry;
+     modify_entry_kernel(fp_addr, entry, (ori_prot | PTE_DBM) & ~PTE_RDONLY);
+@@ -240,40 +326,36 @@ void fp_unhook(uintptr_t fp_addr, void *backup)
+     isb();
+     flush_icache_all();
+     modify_entry_kernel(fp_addr, entry, ori_prot);
++    rc = hook_reactivation_grace();
++    return rc;
+ }
+-KP_EXPORT_SYMBOL(fp_unhook);
++KP_EXPORT_SYMBOL(fp_unhook_checked);
+ 
+-hook_err_t fp_hook_wrap(uintptr_t fp_addr, int32_t argno, void *before, void *after, void *udata)
++void fp_unhook(uintptr_t fp_addr, void *backup)
+ {
+-    hook_err_t err = HOOK_NO_ERR;
+-    if (is_bad_address((void *)fp_addr)) return -HOOK_BAD_ADDRESS;
+-    fp_hook_chain_t *chain = hook_get_mem_from_origin(fp_addr);
+-    if (!chain) {
+-        chain = (fp_hook_chain_t *)hook_mem_zalloc(fp_addr, FUNCTION_POINTER_CHAIN);
+-        if (!chain) return -HOOK_NO_MEM;
+-        chain->hook.fp_addr = fp_addr;
+-        chain->hook.replace_addr = (uint64_t)chain->transit;
+-        err = hook_chain_prepare(chain->transit, argno);
+-        if (err) return err;
+-        flush_icache_all();
+-        fp_hook(chain->hook.fp_addr, (void *)chain->hook.replace_addr, (void **)&chain->hook.origin_fp);
+-    }
++    hook_err_t rc = fp_unhook_checked(fp_addr, backup);
++    if (rc) logke("Function-pointer unhook failed rc=%d\n", rc);
++}
++KP_EXPORT_SYMBOL(fp_unhook);
+ 
++static hook_err_t fp_chain_add_locked(fp_hook_chain_t *chain, void *before,
++                                      void *after, void *udata)
++{
+     for (int i = 0; i < FP_HOOK_CHAIN_NUM; i++) {
+         if ((before && chain->befores[i] == before) || (after && chain->afters[i] == after)) return -HOOK_DUPLICATED;
+-
+-        // todo: atomic or lock
+-        if (chain->states[i] == CHAIN_ITEM_STATE_EMPTY) {
+-            chain->states[i] = CHAIN_ITEM_STATE_BUSY;
+-            dsb(ish);
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) ==
++            CHAIN_ITEM_STATE_EMPTY) {
++            __atomic_store_n(&chain->states[i], CHAIN_ITEM_STATE_BUSY,
++                             __ATOMIC_RELEASE);
+             chain->udata[i] = udata;
+             chain->befores[i] = before;
+             chain->afters[i] = after;
+             if (i + 1 > chain->chain_items_max) {
+-                chain->chain_items_max = i + 1;
++                __atomic_store_n(&chain->chain_items_max, i + 1,
++                                 __ATOMIC_RELEASE);
+             }
+-            dsb(ish);
+-            chain->states[i] = CHAIN_ITEM_STATE_READY;
++            __atomic_store_n(&chain->states[i], CHAIN_ITEM_STATE_READY,
++                             __ATOMIC_RELEASE);
+             logkv("Wrap func pointer add: %llx, %llx, %llx successed\n", chain->hook.fp_addr, before, after);
+             return HOOK_NO_ERR;
+         }
+@@ -281,34 +363,221 @@ hook_err_t fp_hook_wrap(uintptr_t fp_addr, int32_t argno, void *before, void *af
+     logkv("Wrap func pointer add: %llx, %llx, %llx failed\n", chain->hook.fp_addr, before, after);
+     return -HOOK_CHAIN_FULL;
+ }
++
++static int fp_chain_find_item(fp_hook_chain_t *chain, void *before,
++                              void *after)
++{
++    for (int i = 0; i < FP_HOOK_CHAIN_NUM; i++) {
++        int state = __atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE);
++        if ((state == CHAIN_ITEM_STATE_READY ||
++             state == CHAIN_ITEM_STATE_BUSY ||
++             state == CHAIN_ITEM_STATE_REMOVING ||
++             state == CHAIN_ITEM_STATE_DRAINING) &&
++            ((before && chain->befores[i] == before) ||
++             (after && chain->afters[i] == after)))
++            return i;
++    }
++    return -1;
++}
++
++hook_err_t fp_hook_wrap(uintptr_t fp_addr, int32_t argno, void *before,
++                        void *after, void *udata)
++{
++    hook_err_t err = HOOK_NO_ERR;
++    int needs_install = 0;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    if (is_bad_address((void *)fp_addr)) return -HOOK_BAD_ADDRESS;
++
++retry:
++    fp_hook_lock();
++    fp_hook_chain_t *chain = hook_get_mem_from_origin(fp_addr);
++    if (chain) {
++        int install_state;
++        if (hook_get_mem_type(chain) != FUNCTION_POINTER_CHAIN) {
++            fp_hook_unlock();
++            return -HOOK_WRONG_TYPE;
++        }
++        install_state = __atomic_load_n(&chain->installed,
++                                        __ATOMIC_ACQUIRE);
++        if (install_state == CHAIN_INSTALL_UPDATING) {
++            fp_hook_unlock();
++            return -HOOK_READER_BUSY;
++        }
++        if (install_state == CHAIN_INSTALL_RETIRED &&
++            !__atomic_load_n(&chain->grace_complete, __ATOMIC_ACQUIRE)) {
++            fp_hook_unlock();
++            err = hook_reactivation_grace();
++            if (err) return err;
++            fp_hook_lock();
++            chain = hook_get_mem_from_origin(fp_addr);
++            if (!chain) {
++                fp_hook_unlock();
++                return -HOOK_NOT_FOUND;
++            }
++            if (__atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE) ==
++                CHAIN_INSTALL_RETIRED)
++                __atomic_store_n(&chain->grace_complete, 1,
++                                 __ATOMIC_RELEASE);
++            fp_hook_unlock();
++            goto retry;
++        }
++        err = fp_chain_add_locked(chain, before, after, udata);
++        if (!err && install_state == CHAIN_INSTALL_RETIRED) {
++            __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
++                             __ATOMIC_RELEASE);
++            needs_install = 1;
++        }
++        fp_hook_unlock();
++        if (!err && needs_install) {
++            flush_icache_all();
++            fp_hook(chain->hook.fp_addr, (void *)chain->hook.replace_addr,
++                    (void **)&chain->hook.origin_fp);
++            fp_hook_lock();
++            __atomic_store_n(&chain->installed, CHAIN_INSTALL_ACTIVE,
++                             __ATOMIC_RELEASE);
++            fp_hook_unlock();
++        }
++        return err;
++    }
++
++    chain = (fp_hook_chain_t *)hook_mem_zalloc(
++        fp_addr, FUNCTION_POINTER_CHAIN);
++    if (!chain) {
++        fp_hook_unlock();
++        return -HOOK_NO_MEM;
++    }
++    chain->hook.fp_addr = fp_addr;
++    chain->hook.replace_addr = (uint64_t)chain->transit;
++    chain->debt_ptr = &hook_deferred_debt;
++    err = hook_chain_prepare(chain->transit, argno);
++    if (err) goto failed;
++    err = fp_chain_add_locked(chain, before, after, udata);
++    if (err) goto failed;
++    __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
++                     __ATOMIC_RELEASE);
++    fp_hook_unlock();
++    flush_icache_all();
++    fp_hook(chain->hook.fp_addr, (void *)chain->hook.replace_addr,
++            (void **)&chain->hook.origin_fp);
++    fp_hook_lock();
++    __atomic_store_n(&chain->installed, CHAIN_INSTALL_ACTIVE,
++                     __ATOMIC_RELEASE);
++    fp_hook_unlock();
++    return HOOK_NO_ERR;
++
++failed:
++    hook_mem_free(chain);
++    fp_hook_unlock();
++    return err;
++}
+ KP_EXPORT_SYMBOL(fp_hook_wrap);
+ 
+-void fp_hook_unwrap(uintptr_t fp_addr, void *before, void *after)
++hook_err_t fp_hook_unwrap_checked(uintptr_t fp_addr, void *before,
++                                  void *after)
+ {
+-    if (is_bad_address((void *)fp_addr)) return;
++    enum hook_remove_state remove_state;
++    int empty = 1;
++    int needs_uninstall = 0;
++    int item;
++    int install_state;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    if (is_bad_address((void *)fp_addr)) return -HOOK_BAD_ADDRESS;
++
++    fp_hook_lock();
+     fp_hook_chain_t *chain = (fp_hook_chain_t *)hook_get_mem_from_origin(fp_addr);
+-    if (!chain) return;
+-    for (int i = 0; i < FP_HOOK_CHAIN_NUM; i++) {
+-        if (chain->states[i] == CHAIN_ITEM_STATE_READY)
+-            if ((before && chain->befores[i] == before) || (after && chain->afters[i] == after)) {
+-                chain->states[i] = CHAIN_ITEM_STATE_BUSY;
+-                dsb(ish);
+-                chain->udata[i] = 0;
+-                chain->befores[i] = 0;
+-                chain->afters[i] = 0;
+-                dsb(ish);
+-                chain->states[i] = CHAIN_ITEM_STATE_EMPTY;
+-                break;
++    if (!chain || hook_get_mem_type(chain) != FUNCTION_POINTER_CHAIN) {
++        fp_hook_unlock();
++        return chain ? -HOOK_WRONG_TYPE : -HOOK_NOT_FOUND;
++    }
++    install_state = __atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE);
++    if (install_state == CHAIN_INSTALL_UPDATING) {
++        fp_hook_unlock();
++        return -HOOK_READER_BUSY;
++    }
++    if (install_state == CHAIN_INSTALL_RETIRED) {
++        if (!__atomic_load_n(&chain->grace_complete, __ATOMIC_ACQUIRE)) {
++            fp_hook_unlock();
++            hook_err_t grace_rc = hook_reactivation_grace();
++            if (grace_rc) return grace_rc;
++            fp_hook_lock();
++            __atomic_store_n(&chain->grace_complete, 1,
++                             __ATOMIC_RELEASE);
++            fp_hook_unlock();
++            return HOOK_NO_ERR;
++        }
++        fp_hook_unlock();
++        return HOOK_NO_ERR;
++    }
++    item = fp_chain_find_item(chain, before, after);
++    if (item < 0) {
++        for (int i = 0; i < FP_HOOK_CHAIN_NUM; i++) {
++            if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
++                CHAIN_ITEM_STATE_EMPTY) {
++                fp_hook_unlock();
++                return -HOOK_NOT_FOUND;
+             }
++        }
++    } else {
++        remove_state = hook_item_begin_remove(
++            &chain->states[item], &chain->debt_counted[item],
++            &chain->readers[item], chain->debt_ptr);
++        if (remove_state == HOOK_REMOVE_FINISHED) {
++            fp_hook_unlock();
++            return HOOK_NO_ERR;
++        }
++        if (remove_state == HOOK_REMOVE_DEFERRED) {
++            fp_hook_unlock();
++            return -HOOK_DEFERRED;
++        }
++        if (remove_state != HOOK_REMOVE_READY) {
++            fp_hook_unlock();
++            return __atomic_load_n(&chain->states[item], __ATOMIC_ACQUIRE) ==
++                CHAIN_ITEM_STATE_DRAINING ? -HOOK_DEFERRED : -HOOK_NOT_FOUND;
++        }
++        chain->udata[item] = 0;
++        chain->befores[item] = 0;
++        chain->afters[item] = 0;
++        hook_item_finish_remove(&chain->states[item],
++                                &chain->debt_counted[item],
++                                chain->debt_ptr);
+     }
+-    logkv("Wrap func pointer remove: %llx, %llx, %llx\n", chain->hook.fp_addr, before, after);
+ 
+     for (int i = 0; i < FP_HOOK_CHAIN_NUM; i++) {
+-        if (chain->states[i] != CHAIN_ITEM_STATE_EMPTY) return;
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
++            CHAIN_ITEM_STATE_EMPTY) {
++            empty = 0;
++            break;
++        }
+     }
+-    fp_unhook(chain->hook.fp_addr, (void *)chain->hook.origin_fp);
+-    // todo: unsafe
+-    hook_mem_free(chain);
+-    logkv("Unwrap func pointer: %llx, %llx, %llx\n", fp_addr, before, after);
++    if (empty) {
++        __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
++                         __ATOMIC_RELEASE);
++        needs_uninstall = 1;
++    }
++    fp_hook_unlock();
++
++    if (needs_uninstall) {
++        hook_err_t unhook_rc = fp_unhook_checked(
++            chain->hook.fp_addr, (void *)chain->hook.origin_fp);
++        fp_hook_lock();
++        __atomic_store_n(&chain->installed, CHAIN_INSTALL_RETIRED,
++                         __ATOMIC_RELEASE);
++        __atomic_store_n(&chain->grace_complete, unhook_rc ? 0 : 1,
++                         __ATOMIC_RELEASE);
++        fp_hook_unlock();
++        if (unhook_rc) return unhook_rc;
++    }
++    logkv("Wrap func pointer remove: %llx, %llx, %llx\n",
++          chain->hook.fp_addr, before, after);
++    return HOOK_NO_ERR;
++}
++KP_EXPORT_SYMBOL(fp_hook_unwrap_checked);
++
++void fp_hook_unwrap(uintptr_t fp_addr, void *before, void *after)
++{
++    hook_err_t rc = fp_hook_unwrap_checked(fp_addr, before, after);
++    if (rc)
++        logke("Function-pointer unwrap deferred/failed rc=%d debt=%d\n",
++              rc, hook_cleanup_pending());
+ }
+-KP_EXPORT_SYMBOL(fp_hook_unwrap);
+\ No newline at end of file
++KP_EXPORT_SYMBOL(fp_hook_unwrap);
+diff --git a/kernel/base/hmem.c b/kernel/base/hmem.c
+index 64ec496747eadfc7d8eb014993fa322ad76bdfd9..9ffafade5a0c9b7e21a353900f1a5e6d6bd2319a 100644
+--- a/kernel/base/hmem.c
++++ b/kernel/base/hmem.c
+@@ -15,6 +15,7 @@ typedef struct
+     int using;
+     enum hook_type type;
+     uintptr_t addr;
++    volatile int cleanup_debt;
+     // must align 8
+     union
+     {
+@@ -44,6 +45,7 @@ void *hook_mem_zalloc(uintptr_t origin_addr, enum hook_type type)
+         wrap->using = 1;
+         wrap->addr = origin_addr;
+         wrap->type = type;
++        wrap->cleanup_debt = 0;
+ 
+         for (uintptr_t i = (uintptr_t)&wrap->chain; i < (uintptr_t)&wrap->chain + sizeof(wrap->chain); i += 8) {
+             *(uint64_t *)i = 0;
+@@ -76,3 +78,20 @@ void *hook_get_mem_from_origin(uint64_t origin_addr)
+     }
+     return 0;
+ }
++
++enum hook_type hook_get_mem_type(void *hook_mem)
++{
++    hook_mem_warp_t *warp;
++    if (!hook_mem) return NONE;
++    warp = local_container_of(hook_mem, hook_mem_warp_t, chain);
++    return warp->using ? warp->type : NONE;
++}
++
++void hook_mem_mark_cleanup_debt(void *hook_mem)
++{
++    hook_mem_warp_t *warp;
++    if (!hook_mem) return;
++    warp = local_container_of(hook_mem, hook_mem_warp_t, chain);
++    if (!__atomic_exchange_n(&warp->cleanup_debt, 1, __ATOMIC_ACQ_REL))
++        __atomic_add_fetch(&hook_deferred_debt, 1, __ATOMIC_ACQ_REL);
++}
+diff --git a/kernel/base/hmem.h b/kernel/base/hmem.h
+index 0ffe448106d236c426d3c6c413d0223f72cbf719..0af2d5c1b9438c2721356e55db620efc3a47a698 100644
+--- a/kernel/base/hmem.h
++++ b/kernel/base/hmem.h
+@@ -12,5 +12,7 @@ int hook_mem_add(uint64_t start, int32_t size);
+ void *hook_mem_zalloc(uintptr_t origin_addr, enum hook_type type);
+ void hook_mem_free(void *hook_mem);
+ void *hook_get_mem_from_origin(uint64_t origin_addr);
++enum hook_type hook_get_mem_type(void *hook_mem);
++void hook_mem_mark_cleanup_debt(void *hook_mem);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/base/hook.c b/kernel/base/hook.c
+index e23e60e6a00b0fad775f9d12f3816735ed8aa5cc..036dc56228ca0ca55ab526afa29a3fa0618c3322 100644
+--- a/kernel/base/hook.c
++++ b/kernel/base/hook.c
+@@ -9,6 +9,8 @@
+ #include <kpmalloc.h>
+ #include <io.h>
+ #include <symbol.h>
++#include <asm/current.h>
++#include <asm/thread_info.h>
+ #include "hmem.h"
+ 
+ #define bits32(n, high, low) ((uint32_t)((n) << (31u - (high))) >> (31u - (high) + (low)))
+@@ -17,6 +19,124 @@
+     (((uint64_t)((n) << (63u - (len - 1))) >> 63u) ? ((n) | (0xFFFFFFFFFFFFFFFF << (len))) : n)
+ #define align_ceil(x, align) (((u64)(x) + (u64)(align) - 1) & ~((u64)(align) - 1))
+ 
++static volatile int32_t hook_chain_guard;
++volatile int32_t hook_deferred_debt;
++
++static void hook_chain_lock(void)
++{
++    while (__atomic_exchange_n(&hook_chain_guard, 1, __ATOMIC_ACQUIRE))
++        asm volatile("yield" ::: "memory");
++}
++
++static void hook_chain_unlock(void)
++{
++    __atomic_store_n(&hook_chain_guard, 0, __ATOMIC_RELEASE);
++}
++
++static int hook_chain_grace_period(void)
++{
++    typedef void (*sync_rcu_tasks_t)(void);
++    sync_rcu_tasks_t sync_rcu_tasks = (sync_rcu_tasks_t)
++        symbol_lookup_name("synchronize_rcu_tasks");
++    if (!sync_rcu_tasks) {
++        logke("hook chain grace unavailable: synchronize_rcu_tasks missing\n");
++        return -HOOK_GRACE_UNAVAILABLE;
++    }
++    sync_rcu_tasks();
++    return HOOK_NO_ERR;
++}
++
++int hook_reactivation_grace(void)
++{
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    return hook_chain_grace_period();
++}
++KP_EXPORT_SYMBOL(hook_reactivation_grace);
++
++int hook_management_context_ok(void)
++{
++    uint64_t daif;
++    struct thread_info *info = current_thread_info();
++
++    asm volatile("mrs %0, daif" : "=r"(daif));
++    if (!info || (daif & (3u << 6)) != 0) return 0;
++    return info->preempt.count == 0;
++}
++KP_EXPORT_SYMBOL(hook_management_context_ok);
++
++int hook_cleanup_pending(void)
++{
++    return __atomic_load_n(&hook_deferred_debt, __ATOMIC_ACQUIRE);
++}
++KP_EXPORT_SYMBOL(hook_cleanup_pending);
++
++hook_err_t hook_cleanup_drain(void)
++{
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    for (unsigned int i = 0; i < 10000000; i++) {
++        if (!hook_cleanup_pending()) return HOOK_NO_ERR;
++        asm volatile("yield" ::: "memory");
++    }
++    return -HOOK_DEFERRED;
++}
++KP_EXPORT_SYMBOL(hook_cleanup_drain);
++
++static inline __attribute__((always_inline)) int32_t
++transit_reader_inc(volatile int32_t *reader)
++{
++    int32_t value;
++    uint32_t status;
++    asm volatile(
++        "1: ldaxr %w[value], [%[reader]]\n"
++        "add %w[value], %w[value], #1\n"
++        "stlxr %w[status], %w[value], [%[reader]]\n"
++        "cbnz %w[status], 1b\n"
++        : [value] "=&r"(value), [status] "=&r"(status)
++        : [reader] "r"(reader)
++        : "memory");
++    return value;
++}
++
++static inline __attribute__((always_inline)) int
++hook_chain_snapshot_items(hook_chain_t *chain,
++                          uint8_t retained[HOOK_CHAIN_NUM])
++{
++    int max = __atomic_load_n(&chain->chain_items_max, __ATOMIC_ACQUIRE);
++    if (max < 0) max = 0;
++    if (max > HOOK_CHAIN_NUM) max = HOOK_CHAIN_NUM;
++
++    for (int i = 0; i < HOOK_CHAIN_NUM; i++) retained[i] = 0;
++    for (int i = 0; i < max; i++) {
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
++            CHAIN_ITEM_STATE_READY)
++            continue;
++        transit_reader_inc(&chain->readers[i]);
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) ==
++            CHAIN_ITEM_STATE_READY) {
++            retained[i] = 1;
++        } else {
++            hook_item_reader_release(
++                &chain->states[i], &chain->readers[i],
++                &chain->debt_counted[i], chain->debt_ptr,
++                &chain->udata[i], &chain->befores[i], &chain->afters[i]);
++        }
++    }
++    return max;
++}
++
++static inline __attribute__((always_inline)) void
++hook_chain_release_items(hook_chain_t *chain,
++                         const uint8_t retained[HOOK_CHAIN_NUM], int max)
++{
++    for (int i = 0; i < max; i++) {
++        if (!retained[i]) continue;
++        hook_item_reader_release(
++            &chain->states[i], &chain->readers[i],
++            &chain->debt_counted[i], chain->debt_ptr,
++            &chain->udata[i], &chain->befores[i], &chain->afters[i]);
++    }
++}
++
+ typedef uint32_t inst_type_t;
+ typedef uint32_t inst_mask_t;
+ 
+@@ -351,11 +471,13 @@ uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)
+     };
+     vptr--;
+     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
++    uint8_t retained[HOOK_CHAIN_NUM];
++    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
+     hook_fargs0_t fargs;
+     fargs.skip_origin = 0;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain0_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -363,11 +485,12 @@ uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)
+         transit0_func_t origin_func = (transit0_func_t)hook_chain->hook.relo_addr;
+         fargs.ret = origin_func();
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain0_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    hook_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ extern void _transit0_end();
+@@ -385,6 +508,8 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+     };
+     vptr--;
+     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
++    uint8_t retained[HOOK_CHAIN_NUM];
++    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
+     hook_fargs4_t fargs;
+     fargs.skip_origin = 0;
+     fargs.arg0 = arg0;
+@@ -392,8 +517,8 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+     fargs.arg2 = arg2;
+     fargs.arg3 = arg3;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain4_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -401,11 +526,12 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+         transit4_func_t origin_func = (transit4_func_t)hook_chain->hook.relo_addr;
+         fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3);
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain4_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    hook_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ 
+@@ -425,6 +551,8 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
+     };
+     vptr--;
+     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
++    uint8_t retained[HOOK_CHAIN_NUM];
++    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
+     hook_fargs8_t fargs;
+     fargs.skip_origin = 0;
+     fargs.arg0 = arg0;
+@@ -436,8 +564,8 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
+     fargs.arg6 = arg6;
+     fargs.arg7 = arg7;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain8_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -446,11 +574,12 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
+         fargs.ret =
+             origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6, fargs.arg7);
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain8_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    hook_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ 
+@@ -471,6 +600,8 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t
+     };
+     vptr--;
+     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
++    uint8_t retained[HOOK_CHAIN_NUM];
++    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
+     hook_fargs12_t fargs;
+     fargs.skip_origin = 0;
+     fargs.arg0 = arg0;
+@@ -486,8 +617,8 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t
+     fargs.arg10 = arg10;
+     fargs.arg11 = arg11;
+     fargs.chain = hook_chain;
+-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = 0; i < retained_max; i++) {
++        if (!retained[i]) continue;
+         hook_chain12_callback func = hook_chain->befores[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
+@@ -496,11 +627,12 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t
+         fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6,
+                                 fargs.arg7, fargs.arg8, fargs.arg9, fargs.arg10, fargs.arg11);
+     }
+-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
+-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
++    for (int32_t i = retained_max - 1; i >= 0; i--) {
++        if (!retained[i]) continue;
+         hook_chain12_callback func = hook_chain->afters[i];
+         if (func) func(&fargs, hook_chain->udata[i]);
+     }
++    hook_chain_release_items(hook_chain, retained, retained_max);
+     return fargs.ret;
+ }
+ 
+@@ -603,6 +735,10 @@ KP_EXPORT_SYMBOL(hook_prepare);
+ // todo:
+ void hook_install(hook_t *hook)
+ {
++    if (!hook_management_context_ok()) {
++        logke("Hook install rejected outside process context\n");
++        return;
++    }
+     uint64_t va = hook->origin_addr;
+     uint64_t *entry = pgtable_entry_kernel(va);
+     uint64_t ori_prot = *entry;
+@@ -619,6 +755,10 @@ KP_EXPORT_SYMBOL(hook_install);
+ 
+ void hook_uninstall(hook_t *hook)
+ {
++    if (!hook_management_context_ok()) {
++        logke("Hook uninstall rejected outside process context\n");
++        return;
++    }
+     uint64_t va = hook->origin_addr;
+     uint64_t *entry = pgtable_entry_kernel(va);
+     uint64_t ori_prot = *entry;
+@@ -635,6 +775,7 @@ KP_EXPORT_SYMBOL(hook_uninstall);
+ hook_err_t hook(void *func, void *replace, void **backup)
+ {
+     hook_err_t err = HOOK_NO_ERR;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+     if (!func || !replace || !backup) {
+         return -HOOK_BAD_ADDRESS;
+     }
+@@ -660,14 +801,29 @@ out:
+ }
+ KP_EXPORT_SYMBOL(hook);
+ 
+-void unhook(void *func)
++hook_err_t unhook_checked(void *func)
+ {
++    enum hook_type type;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
+     uint64_t origin = branch_func_addr((uint64_t)func);
+     hook_t *hook = hook_get_mem_from_origin(origin);
+-    if (!hook) return;
+-    hook_uninstall(hook);
+-    hook_mem_free(hook);
+-    logkv("Unhook func: %llx\n", func);
++    if (!hook) return -HOOK_NOT_FOUND;
++    type = hook_get_mem_type(hook);
++    if (type != INLINE) {
++        logke("Generic unhook refused type=%d func=%llx\n", type, func);
++        return -HOOK_WRONG_TYPE;
++    }
++    hook_mem_mark_cleanup_debt(hook);
++    logke("Plain INLINE unhook is unload-unsafe; use hook_wrap for removable hooks\n");
++    return -HOOK_DEFERRED;
++}
++KP_EXPORT_SYMBOL(unhook_checked);
++
++void unhook(void *func)
++{
++    hook_err_t rc = unhook_checked(func);
++    if (rc) logke("Unhook failed func=%llx rc=%d\n", func, rc);
+ }
+ KP_EXPORT_SYMBOL(unhook);
+ 
+@@ -701,7 +857,7 @@ static hook_err_t hook_chain_prepare(uint32_t *transit, int32_t argno)
+ 
+     int32_t transit_num = (transit_end - transit_start) / 4;
+     // todo:assert
+-    if (transit_num >= TRANSIT_INST_NUM) return -HOOK_TRANSIT_NO_MEM;
++    if (transit_num > TRANSIT_INST_NUM - 2) return -HOOK_TRANSIT_NO_MEM;
+ 
+     transit[0] = ARM64_BTI_JC;
+     transit[1] = ARM64_NOP;
+@@ -711,23 +867,27 @@ static hook_err_t hook_chain_prepare(uint32_t *transit, int32_t argno)
+     return HOOK_NO_ERR;
+ }
+ 
+-hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after, void *udata)
++static hook_err_t hook_chain_add_locked(hook_chain_t *chain, void *before,
++                                        void *after, void *udata)
+ {
+     for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
+-        if ((before && chain->befores[i] == before) || (after && chain->afters[i] == after)) return -HOOK_DUPLICATED;
+-
+-        // todo: atomic or lock
+-        if (chain->states[i] == CHAIN_ITEM_STATE_EMPTY) {
+-            chain->states[i] = CHAIN_ITEM_STATE_BUSY;
+-            dsb(ish);
++        if ((before && chain->befores[i] == before) ||
++            (after && chain->afters[i] == after))
++            return -HOOK_DUPLICATED;
++
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) ==
++            CHAIN_ITEM_STATE_EMPTY) {
++            __atomic_store_n(&chain->states[i], CHAIN_ITEM_STATE_BUSY,
++                             __ATOMIC_RELEASE);
+             chain->udata[i] = udata;
+             chain->befores[i] = before;
+             chain->afters[i] = after;
+             if (i + 1 > chain->chain_items_max) {
+-                chain->chain_items_max = i + 1;
++                __atomic_store_n(&chain->chain_items_max, i + 1,
++                                 __ATOMIC_RELEASE);
+             }
+-            dsb(ish);
+-            chain->states[i] = CHAIN_ITEM_STATE_READY;
++            __atomic_store_n(&chain->states[i], CHAIN_ITEM_STATE_READY,
++                             __ATOMIC_RELEASE);
+             logkv("Wrap chain add: %llx, %llx, %llx successed\n", chain->hook.func_addr, before, after);
+             return HOOK_NO_ERR;
+         }
+@@ -735,39 +895,149 @@ hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after, void *
+     logkv("Wrap chain add: %llx, %llx, %llx failed\n", chain->hook.func_addr, before, after);
+     return -HOOK_CHAIN_FULL;
+ }
++
++hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after,
++                          void *udata)
++{
++    hook_err_t rc;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    if (!chain) return -HOOK_BAD_ADDRESS;
++    hook_chain_lock();
++    rc = hook_chain_add_locked(chain, before, after, udata);
++    hook_chain_unlock();
++    return rc;
++}
+ KP_EXPORT_SYMBOL(hook_chain_add);
+ 
+-void hook_chain_remove(hook_chain_t *chain, void *before, void *after)
++static int hook_chain_find_item(hook_chain_t *chain, void *before,
++                                void *after)
+ {
+     for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
+-        if (chain->states[i] == CHAIN_ITEM_STATE_READY)
+-            if ((before && chain->befores[i] == before) || (after && chain->afters[i] == after)) {
+-                chain->states[i] = CHAIN_ITEM_STATE_BUSY;
+-                dsb(ish);
+-                chain->udata[i] = 0;
+-                chain->befores[i] = 0;
+-                chain->afters[i] = 0;
+-                dsb(ish);
+-                chain->states[i] = CHAIN_ITEM_STATE_EMPTY;
+-                break;
+-            }
++        int state = __atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE);
++        if ((state == CHAIN_ITEM_STATE_READY ||
++             state == CHAIN_ITEM_STATE_BUSY ||
++             state == CHAIN_ITEM_STATE_REMOVING ||
++             state == CHAIN_ITEM_STATE_DRAINING) &&
++            ((before && chain->befores[i] == before) ||
++             (after && chain->afters[i] == after)))
++            return i;
+     }
+-    logkv("Wrap chain remove: %llx, %llx, %llx\n", chain->hook.func_addr, before, after);
++    return -1;
++}
++
++hook_err_t hook_chain_remove_checked(hook_chain_t *chain, void *before,
++                                     void *after)
++{
++    int item;
++    enum hook_remove_state remove_state;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    if (!chain) return -HOOK_BAD_ADDRESS;
++
++    hook_chain_lock();
++    item = hook_chain_find_item(chain, before, after);
++    if (item < 0) {
++        hook_chain_unlock();
++        return -HOOK_NOT_FOUND;
++    }
++    remove_state = hook_item_begin_remove(
++        &chain->states[item], &chain->debt_counted[item],
++        &chain->readers[item], chain->debt_ptr);
++    if (remove_state == HOOK_REMOVE_FINISHED) {
++        hook_chain_unlock();
++        return HOOK_NO_ERR;
++    }
++    if (remove_state == HOOK_REMOVE_DEFERRED) {
++        hook_chain_unlock();
++        return -HOOK_DEFERRED;
++    }
++    if (remove_state != HOOK_REMOVE_READY) {
++        hook_chain_unlock();
++        return __atomic_load_n(&chain->states[item], __ATOMIC_ACQUIRE) ==
++            CHAIN_ITEM_STATE_DRAINING ? -HOOK_DEFERRED : -HOOK_NOT_FOUND;
++    }
++    chain->udata[item] = 0;
++    chain->befores[item] = 0;
++    chain->afters[item] = 0;
++    hook_item_finish_remove(&chain->states[item],
++                            &chain->debt_counted[item],
++                            chain->debt_ptr);
++    hook_chain_unlock();
++    logkv("Wrap chain remove: %llx, %llx, %llx\n",
++          chain->hook.func_addr, before, after);
++    return HOOK_NO_ERR;
++}
++KP_EXPORT_SYMBOL(hook_chain_remove_checked);
++
++void hook_chain_remove(hook_chain_t *chain, void *before, void *after)
++{
++    hook_err_t rc = hook_chain_remove_checked(chain, before, after);
++    if (rc)
++        logke("Wrap chain removal deferred/failed rc=%d debt=%d\n",
++              rc, hook_cleanup_pending());
+ }
+ KP_EXPORT_SYMBOL(hook_chain_remove);
+ 
+-// todo: lock
+ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void *udata)
+ {
++    hook_err_t err;
++    int needs_install = 0;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+     if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
+     uint64_t faddr = (uint64_t)func;
+     uint64_t origin = branch_func_addr(faddr);
+     if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
++
++retry:
++    hook_chain_lock();
+     hook_chain_t *chain = (hook_chain_t *)hook_get_mem_from_origin(origin);
+-    if (chain) return hook_chain_add(chain, before, after, udata);
++    if (chain) {
++        int install_state = __atomic_load_n(&chain->installed,
++                                            __ATOMIC_ACQUIRE);
++        if (install_state == CHAIN_INSTALL_UPDATING) {
++            hook_chain_unlock();
++            return -HOOK_READER_BUSY;
++        }
++        if (install_state == CHAIN_INSTALL_RETIRED &&
++            !__atomic_load_n(&chain->grace_complete, __ATOMIC_ACQUIRE)) {
++            hook_chain_unlock();
++            err = hook_reactivation_grace();
++            if (err) return err;
++            hook_chain_lock();
++            chain = (hook_chain_t *)hook_get_mem_from_origin(origin);
++            if (!chain) {
++                hook_chain_unlock();
++                return -HOOK_NOT_FOUND;
++            }
++            if (__atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE) ==
++                CHAIN_INSTALL_RETIRED)
++                __atomic_store_n(&chain->grace_complete, 1,
++                                 __ATOMIC_RELEASE);
++            hook_chain_unlock();
++            goto retry;
++        }
++        err = hook_chain_add_locked(chain, before, after, udata);
++        if (!err && install_state == CHAIN_INSTALL_RETIRED) {
++            __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
++                             __ATOMIC_RELEASE);
++            needs_install = 1;
++        }
++        hook_chain_unlock();
++        if (!err && needs_install) {
++            hook_chain_install(chain);
++            hook_chain_lock();
++            __atomic_store_n(&chain->installed, CHAIN_INSTALL_ACTIVE,
++                             __ATOMIC_RELEASE);
++            hook_chain_unlock();
++        }
++        return err;
++    }
+     chain = (hook_chain_t *)hook_mem_zalloc(origin, INLINE_CHAIN);
+-    if (!chain) return -HOOK_NO_MEM;
++    if (!chain) {
++        hook_chain_unlock();
++        return -HOOK_NO_MEM;
++    }
+     chain->chain_items_max = 0;
++    chain->debt_ptr = &hook_deferred_debt;
+     hook_t *hook = &chain->hook;
+     hook->func_addr = faddr;
+     hook->origin_addr = origin;
+@@ -775,39 +1045,107 @@ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void
+     hook->relo_addr = (uint64_t)hook->relo_insts;
+     logkv("Wrap func: %llx, origin: %llx, replace: %llx, relocate: %llx, chain: %llx\n", hook->func_addr,
+           hook->origin_addr, hook->replace_addr, hook->relo_addr, chain);
+-    hook_err_t err = hook_prepare(hook);
++    err = hook_prepare(hook);
+     if (err) goto err;
+     err = hook_chain_prepare(chain->transit, argno);
+     if (err) goto err;
+-    err = hook_chain_add(chain, before, after, udata);
++    err = hook_chain_add_locked(chain, before, after, udata);
+     if (err) goto err;
++    __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
++                     __ATOMIC_RELEASE);
++    hook_chain_unlock();
+     hook_chain_install(chain);
++    hook_chain_lock();
++    __atomic_store_n(&chain->installed, CHAIN_INSTALL_ACTIVE,
++                     __ATOMIC_RELEASE);
++    hook_chain_unlock();
+     logkv("Wrap func: %llx succsseed\n", hook->func_addr);
+     return HOOK_NO_ERR;
+ err:
+     hook_mem_free(chain);
++    hook_chain_unlock();
+     logkv("Wrap func: %llx failed, err: %d\n", hook->func_addr, err);
+     return err;
+ }
+ KP_EXPORT_SYMBOL(hook_wrap);
+ 
+-void hook_unwrap_remove(void *func, void *before, void *after, int remove)
++hook_err_t hook_unwrap_remove_checked(void *func, void *before, void *after,
++                                      int remove)
+ {
+-    if (is_bad_address(func)) return;
++    hook_err_t rc;
++    int empty = 1;
++    int needs_uninstall = 0;
++    int install_state;
++    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
++    if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
+     uint64_t faddr = (uint64_t)func;
+     uint64_t origin = branch_func_addr(faddr);
+-    if (is_bad_address(func)) return;
++    if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
++    hook_chain_lock();
+     hook_chain_t *chain = (hook_chain_t *)hook_get_mem_from_origin(origin);
+-    if (!chain) return;
+-    hook_chain_remove(chain, before, after);
+-    if (!remove) return;
+-    // todo:
++    if (!chain || hook_get_mem_type(chain) != INLINE_CHAIN) {
++        hook_chain_unlock();
++        return chain ? -HOOK_WRONG_TYPE : -HOOK_NOT_FOUND;
++    }
++    install_state = __atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE);
++    if (install_state == CHAIN_INSTALL_UPDATING) {
++        hook_chain_unlock();
++        return -HOOK_READER_BUSY;
++    }
++    if (install_state == CHAIN_INSTALL_RETIRED) {
++        hook_chain_unlock();
++        /* Last-item removal is idempotent so a module exit can be retried
++         * after a later teardown step failed.  The chain allocation is never
++         * freed; grace is required only before a future reactivation. */
++        return HOOK_NO_ERR;
++    }
++    hook_chain_unlock();
++
++    rc = hook_chain_remove_checked(chain, before, after);
++    if (rc && rc != -HOOK_NOT_FOUND) return rc;
++    if (!remove) return HOOK_NO_ERR;
++
++    hook_chain_lock();
+     for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
+-        if (chain->states[i] != CHAIN_ITEM_STATE_EMPTY) return;
++        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
++            CHAIN_ITEM_STATE_EMPTY) {
++            empty = 0;
++            break;
++        }
+     }
+-    hook_chain_uninstall(chain);
+-    // todo: unsafe
+-    hook_mem_free(chain);
++    if (!empty) {
++        hook_chain_unlock();
++        return HOOK_NO_ERR;
++    }
++    if (__atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE) ==
++        CHAIN_INSTALL_ACTIVE) {
++        __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
++                         __ATOMIC_RELEASE);
++        needs_uninstall = 1;
++    }
++    hook_chain_unlock();
++
++    if (needs_uninstall) {
++        hook_chain_uninstall(chain);
++        hook_chain_lock();
++        __atomic_store_n(&chain->installed, CHAIN_INSTALL_RETIRED,
++                         __ATOMIC_RELEASE);
++        __atomic_store_n(&chain->grace_complete, 0, __ATOMIC_RELEASE);
++        hook_chain_unlock();
++    }
++
++    /* Keep the prepared chain allocation for safe reuse.  Immediate free is
++     * unsafe for a CPU that already branched into transit before uninstall. */
+     logkv("Unwrap func: %llx\n", func);
++    return HOOK_NO_ERR;
++}
++KP_EXPORT_SYMBOL(hook_unwrap_remove_checked);
++
++void hook_unwrap_remove(void *func, void *before, void *after, int remove)
++{
++    hook_err_t rc = hook_unwrap_remove_checked(func, before, after, remove);
++    if (rc)
++        logke("Unwrap deferred/failed rc=%d debt=%d\n", rc,
++              hook_cleanup_pending());
+ }
+ KP_EXPORT_SYMBOL(hook_unwrap_remove);
+diff --git a/kernel/include/hook.h b/kernel/include/hook.h
+index b9ced847a9e7a5d1c9d47200a6c0075ec8ce5d8a..49687ef1232fffef62c0b925952505b04db27540 100644
+--- a/kernel/include/hook.h
++++ b/kernel/include/hook.h
+@@ -8,6 +8,7 @@
+ 
+ #include <stdint.h>
+ #include <log.h>
++#include <hook_lifecycle.h>
+ 
+ #define HOOK_INTO_BRANCH_FUNC
+ 
+@@ -20,8 +21,21 @@ typedef enum
+     HOOK_BAD_RELO = 4092,
+     HOOK_TRANSIT_NO_MEM = 4091,
+     HOOK_CHAIN_FULL = 4090,
++    HOOK_NOT_FOUND = 4089,
++    HOOK_GRACE_UNAVAILABLE = 4088,
++    HOOK_READER_BUSY = 4087,
++    HOOK_DEFERRED = 4086,
++    HOOK_WRONG_TYPE = 4085,
++    HOOK_BAD_CONTEXT = 4084,
+ } hook_err_t;
+ 
++/* Hook installation, removal, and reactivation are process-context APIs.
++ * Callers must have IRQs and preemption enabled.  Checked entry points return
++ * -HOOK_BAD_CONTEXT otherwise; legacy void wrappers log and leave ownership
++ * unchanged.  Callback removal may return -HOOK_DEFERRED after publishing the
++ * item BUSY.  The caller must retain its module text and retry from process
++ * context after the active callback returns. */
++
+ enum hook_type
+ {
+     NONE = 0,
+@@ -32,10 +46,6 @@ enum hook_type
+ 
+ typedef int8_t chain_item_state;
+ 
+-#define CHAIN_ITEM_STATE_EMPTY 0
+-#define CHAIN_ITEM_STATE_READY 1
+-#define CHAIN_ITEM_STATE_BUSY 2
+-
+ #define local_offsetof(TYPE, MEMBER) ((size_t) & ((TYPE *)0)->MEMBER)
+ #define local_container_of(ptr, type, member) ({ (type *)((char *)(ptr) - local_offsetof(type, member)); })
+ 
+@@ -44,7 +54,7 @@ typedef int8_t chain_item_state;
+ #define RELOCATE_INST_NUM (TRAMPOLINE_NUM * 8 + 8)
+ 
+ #define HOOK_CHAIN_NUM 0x10
+-#define TRANSIT_INST_NUM 0x60
++#define TRANSIT_INST_NUM 0x100
+ 
+ #define FP_HOOK_CHAIN_NUM 0x20
+ 
+@@ -53,6 +63,10 @@ typedef int8_t chain_item_state;
+ #define ARM64_BTI_J 0xd503249f
+ #define ARM64_BTI_JC 0xd50324df
+ 
++#define CHAIN_INSTALL_RETIRED 0
++#define CHAIN_INSTALL_ACTIVE 1
++#define CHAIN_INSTALL_UPDATING 2
++
+ typedef struct
+ {
+     // in
+@@ -207,9 +221,14 @@ typedef struct _hook_chain
+     hook_t hook;
+     int32_t chain_items_max;
+     chain_item_state states[HOOK_CHAIN_NUM];
++    volatile int32_t readers[HOOK_CHAIN_NUM];
++    uint8_t debt_counted[HOOK_CHAIN_NUM];
++    volatile int32_t *debt_ptr;
+     void *udata[HOOK_CHAIN_NUM];
+     void *befores[HOOK_CHAIN_NUM];
+     void *afters[HOOK_CHAIN_NUM];
++    volatile int32_t installed;
++    volatile int32_t grace_complete;
+     uint32_t transit[TRANSIT_INST_NUM];
+ } hook_chain_t __attribute__((aligned(8)));
+ 
+@@ -225,9 +244,14 @@ typedef struct _fphook_chain
+     fp_hook_t hook;
+     int32_t chain_items_max;
+     chain_item_state states[FP_HOOK_CHAIN_NUM];
++    volatile int32_t readers[FP_HOOK_CHAIN_NUM];
++    uint8_t debt_counted[FP_HOOK_CHAIN_NUM];
++    volatile int32_t *debt_ptr;
+     void *udata[FP_HOOK_CHAIN_NUM];
+     void *befores[FP_HOOK_CHAIN_NUM];
+     void *afters[FP_HOOK_CHAIN_NUM];
++    volatile int32_t installed;
++    volatile int32_t grace_complete;
+     uint32_t transit[TRANSIT_INST_NUM];
+ } fp_hook_chain_t __attribute__((aligned(8)));
+ 
+@@ -267,6 +291,12 @@ hook_err_t hook(void *func, void *replace, void **backup);
+  * @param func 
+  */
+ void unhook(void *func);
++hook_err_t unhook_checked(void *func);
++int hook_cleanup_pending(void);
++hook_err_t hook_cleanup_drain(void);
++int hook_management_context_ok(void);
++int hook_reactivation_grace(void);
++extern volatile int32_t hook_deferred_debt;
+ 
+ /**
+  * @brief 
+@@ -286,6 +316,8 @@ hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after, void *
+  * @param after 
+  */
+ void hook_chain_remove(hook_chain_t *chain, void *before, void *after);
++hook_err_t hook_chain_remove_checked(hook_chain_t *chain, void *before,
++                                     void *after);
+ 
+ /**
+  * @brief Wrap a function with before and after function. 
+@@ -313,6 +345,8 @@ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void
+  * @param remove 
+  */
+ void hook_unwrap_remove(void *func, void *before, void *after, int remove);
++hook_err_t hook_unwrap_remove_checked(void *func, void *before, void *after,
++                                      int remove);
+ 
+ static inline void hook_unwrap(void *func, void *before, void *after)
+ {
+@@ -345,6 +379,7 @@ void fp_hook(uintptr_t fp_addr, void *replace, void **backup);
+  * @param backup 
+  */
+ void fp_unhook(uintptr_t fp_addr, void *backup);
++hook_err_t fp_unhook_checked(uintptr_t fp_addr, void *backup);
+ 
+ /**
+  * @brief 
+@@ -366,6 +401,8 @@ hook_err_t fp_hook_wrap(uintptr_t fp_addr, int32_t argno, void *before, void *af
+  * @param after 
+  */
+ void fp_hook_unwrap(uintptr_t fp_addr, void *before, void *after);
++hook_err_t fp_hook_unwrap_checked(uintptr_t fp_addr, void *before,
++                                  void *after);
+ 
+ /**
+  * 
+diff --git a/kernel/include/hook_lifecycle.h b/kernel/include/hook_lifecycle.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9420854846efbd03870655dfc33b0a2783575f5e
+--- /dev/null
++++ b/kernel/include/hook_lifecycle.h
+@@ -0,0 +1,184 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef _KP_HOOK_LIFECYCLE_H_
++#define _KP_HOOK_LIFECYCLE_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define CHAIN_ITEM_STATE_EMPTY 0
++#define CHAIN_ITEM_STATE_READY 1
++#define CHAIN_ITEM_STATE_BUSY 2
++#define CHAIN_ITEM_STATE_DRAINING 3
++#define CHAIN_ITEM_STATE_REMOVING 4
++
++enum hook_remove_state
++{
++    HOOK_REMOVE_NOT_FOUND = 0,
++    HOOK_REMOVE_DEFERRED,
++    HOOK_REMOVE_READY,
++    HOOK_REMOVE_FINISHED,
++};
++
++static inline __attribute__((always_inline)) int hook_item_claim_state(
++    int8_t *state, int8_t expected, int8_t desired)
++{
++#if defined(__aarch64__)
++    uint32_t observed;
++    uint32_t status;
++    asm volatile(
++        "1: ldaxrb %w[observed], [%[state]]\n"
++        "cmp %w[observed], %w[expected]\n"
++        "b.ne 2f\n"
++        "stlxrb %w[status], %w[desired], [%[state]]\n"
++        "cbnz %w[status], 1b\n"
++        "2:\n"
++        : [observed] "=&r"(observed), [status] "=&r"(status)
++        : [state] "r"(state), [expected] "r"((uint32_t)(uint8_t)expected),
++          [desired] "r"((uint32_t)(uint8_t)desired)
++        : "cc", "memory");
++    return observed == (uint8_t)expected;
++#else
++    return __atomic_compare_exchange_n(
++        state, &expected, desired, false,
++        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++#endif
++}
++
++static inline __attribute__((always_inline)) int32_t
++hook_item_debt_dec(volatile int32_t *debt)
++{
++#if defined(__aarch64__)
++    int32_t value;
++    uint32_t status;
++    asm volatile(
++        "1: ldaxr %w[value], [%[debt]]\n"
++        "sub %w[value], %w[value], #1\n"
++        "stlxr %w[status], %w[value], [%[debt]]\n"
++        "cbnz %w[status], 1b\n"
++        : [value] "=&r"(value), [status] "=&r"(status)
++        : [debt] "r"(debt)
++        : "memory");
++    return value;
++#else
++    return __atomic_sub_fetch(debt, 1, __ATOMIC_ACQ_REL);
++#endif
++}
++
++static inline __attribute__((always_inline)) int32_t
++hook_item_reader_dec(volatile int32_t *reader)
++{
++#if defined(__aarch64__)
++    int32_t value;
++    uint32_t status;
++    asm volatile(
++        "1: ldaxr %w[value], [%[reader]]\n"
++        "sub %w[value], %w[value], #1\n"
++        "stlxr %w[status], %w[value], [%[reader]]\n"
++        "cbnz %w[status], 1b\n"
++        : [value] "=&r"(value), [status] "=&r"(status)
++        : [reader] "r"(reader)
++        : "memory");
++    return value;
++#else
++    return __atomic_sub_fetch(reader, 1, __ATOMIC_ACQ_REL);
++#endif
++}
++
++static inline __attribute__((always_inline)) void hook_item_publish_debt(
++    uint8_t *debt_counted, volatile int32_t *debt)
++{
++    __atomic_add_fetch(debt, 1, __ATOMIC_ACQ_REL);
++    __atomic_store_n(debt_counted, 1, __ATOMIC_RELEASE);
++}
++
++static inline __attribute__((always_inline)) int
++hook_item_try_claim_removing_drain(
++    int8_t *state, volatile int32_t *readers)
++{
++    if (__atomic_load_n(readers, __ATOMIC_ACQUIRE) != 0) return 0;
++    return hook_item_claim_state(state, CHAIN_ITEM_STATE_REMOVING,
++                                 CHAIN_ITEM_STATE_DRAINING);
++}
++
++static inline __attribute__((always_inline)) void hook_item_publish_waiting(
++    int8_t *state)
++{
++    __atomic_store_n(state, CHAIN_ITEM_STATE_BUSY, __ATOMIC_RELEASE);
++}
++
++static inline __attribute__((always_inline)) enum hook_remove_state
++hook_item_begin_remove(
++    int8_t *state, uint8_t *debt_counted, volatile int32_t *readers,
++    volatile int32_t *debt)
++{
++    int item_state = __atomic_load_n(state, __ATOMIC_ACQUIRE);
++    if (item_state == CHAIN_ITEM_STATE_READY) {
++        if (!hook_item_claim_state(state, CHAIN_ITEM_STATE_READY,
++                                   CHAIN_ITEM_STATE_REMOVING))
++            item_state = __atomic_load_n(state, __ATOMIC_ACQUIRE);
++        else {
++            hook_item_publish_debt(debt_counted, debt);
++            if (hook_item_try_claim_removing_drain(state, readers))
++                return HOOK_REMOVE_READY;
++            hook_item_publish_waiting(state);
++            if (__atomic_load_n(readers, __ATOMIC_ACQUIRE) == 0) {
++                if (hook_item_claim_state(state, CHAIN_ITEM_STATE_BUSY,
++                                          CHAIN_ITEM_STATE_DRAINING))
++                    return HOOK_REMOVE_READY;
++                if (__atomic_load_n(state, __ATOMIC_ACQUIRE) ==
++                    CHAIN_ITEM_STATE_EMPTY)
++                    return HOOK_REMOVE_FINISHED;
++            }
++            return HOOK_REMOVE_DEFERRED;
++        }
++    }
++    if (item_state == CHAIN_ITEM_STATE_BUSY) {
++        if (__atomic_load_n(readers, __ATOMIC_ACQUIRE) == 0) {
++            if (hook_item_claim_state(state, CHAIN_ITEM_STATE_BUSY,
++                                      CHAIN_ITEM_STATE_DRAINING))
++                return HOOK_REMOVE_READY;
++            if (__atomic_load_n(state, __ATOMIC_ACQUIRE) ==
++                CHAIN_ITEM_STATE_EMPTY)
++                return HOOK_REMOVE_FINISHED;
++        }
++        return HOOK_REMOVE_DEFERRED;
++    }
++    if (item_state == CHAIN_ITEM_STATE_REMOVING ||
++        item_state == CHAIN_ITEM_STATE_DRAINING)
++        return HOOK_REMOVE_DEFERRED;
++    return HOOK_REMOVE_NOT_FOUND;
++}
++
++static inline __attribute__((always_inline)) int hook_item_try_claim_drain(
++    int8_t *state, volatile int32_t *readers)
++{
++    if (__atomic_load_n(readers, __ATOMIC_ACQUIRE) != 0) return 0;
++    return hook_item_claim_state(state, CHAIN_ITEM_STATE_BUSY,
++                                 CHAIN_ITEM_STATE_DRAINING);
++}
++
++static inline __attribute__((always_inline)) void hook_item_finish_remove(
++    int8_t *state, uint8_t *debt_counted, volatile int32_t *debt)
++{
++    if (__atomic_load_n(debt_counted, __ATOMIC_ACQUIRE)) {
++        __atomic_store_n(debt_counted, 0, __ATOMIC_RELEASE);
++        hook_item_debt_dec(debt);
++    }
++    __atomic_store_n(state, CHAIN_ITEM_STATE_EMPTY, __ATOMIC_RELEASE);
++}
++
++static inline __attribute__((always_inline)) int hook_item_reader_release(
++    int8_t *state, volatile int32_t *readers, uint8_t *debt_counted,
++    volatile int32_t *debt, void **udata, void **before, void **after)
++{
++    if (hook_item_reader_dec(readers) != 0) return 0;
++    if (!hook_item_try_claim_drain(state, readers)) return 0;
++    *udata = 0;
++    *before = 0;
++    *after = 0;
++    hook_item_finish_remove(state, debt_counted, debt);
++    return 1;
++}
++
++#endif
+diff --git a/kernel/linux/include/linux/rcupdate.h b/kernel/linux/include/linux/rcupdate.h
+index 43090ad758844406fb4623a48e0f9c35f42a6c6e..0bd0ee16d840d39005bc08f9a68cafd40156da8f 100644
+--- a/kernel/linux/include/linux/rcupdate.h
++++ b/kernel/linux/include/linux/rcupdate.h
+@@ -73,7 +73,7 @@ static inline void rcu_barrier_tasks_rude(void)
+ }
+ static inline void synchronize_rcu(void)
+ {
+-    kfunc_call(rcu_barrier_tasks_rude)
++    kfunc_call(synchronize_rcu)
+ }
+ static inline unsigned long get_completed_synchronize_rcu(void)
+ {
+@@ -343,4 +343,4 @@ static inline bool rcu_head_after_call_rcu(struct rcu_head *rhp, rcu_callback_t
+     return false;
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/patch/common/syscall.c b/kernel/patch/common/syscall.c
+index 6a7c39094768eeeb5f9edf651524652fa6ab974e..f476c52489095155bcd3a8a44a810339c0151aa5 100644
+--- a/kernel/patch/common/syscall.c
++++ b/kernel/patch/common/syscall.c
+@@ -20,6 +20,72 @@
+ #include <kputils.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
++#include <syscall_route.h>
++
++#define SYSCALL_ROUTE_COUNT 460
++
++static struct syscall_hook_route syscall_routes[SYSCALL_ROUTE_COUNT];
++static struct syscall_hook_route compat_syscall_routes[SYSCALL_ROUTE_COUNT];
++
++static struct syscall_hook_route *syscall_route_slot(int nr, int is_compat)
++{
++    if (nr < 0 || nr >= SYSCALL_ROUTE_COUNT) return 0;
++    return is_compat ? &compat_syscall_routes[nr] : &syscall_routes[nr];
++}
++
++static hook_err_t syscall_wrap_recorded(int nr, int narg, int is_compat,
++                                        void *before, void *after,
++                                        void *udata)
++{
++    struct syscall_hook_route *route = syscall_route_slot(nr, is_compat);
++    struct syscall_hook_route_claim claim;
++    uintptr_t fp_target = 0;
++    uintptr_t inline_target = 0;
++    int claim_rc;
++    hook_err_t rc;
++
++    if (!route) return -HOOK_BAD_ADDRESS;
++    if (__atomic_load_n(&route->state, __ATOMIC_ACQUIRE) ==
++        SYSCALL_ROUTE_UNBOUND) {
++        uintptr_t *table = is_compat ? compat_sys_call_table : sys_call_table;
++        if (table)
++            fp_target = (uintptr_t)(table + nr);
++        else
++            inline_target = syscalln_name_addr(nr, is_compat);
++    }
++    claim_rc = syscall_hook_route_begin_install(
++        route, fp_target, inline_target, &claim);
++    if (claim_rc) return claim_rc == -2 ? -HOOK_READER_BUSY
++                                       : -HOOK_BAD_ADDRESS;
++    if (has_syscall_wrapper) narg = 1;
++    if (claim.backend == SYSCALL_HOOK_FUNCTION_POINTER)
++        rc = fp_hook_wrap(claim.target, narg, before, after, udata);
++    else
++        rc = hook_wrap((void *)claim.target, narg, before, after, udata);
++    syscall_hook_route_finish_install(route, &claim, rc == HOOK_NO_ERR);
++    return rc;
++}
++
++static hook_err_t syscall_unwrap_recorded(int nr, int is_compat,
++                                          void *before, void *after)
++{
++    struct syscall_hook_route *route = syscall_route_slot(nr, is_compat);
++    struct syscall_hook_route_claim claim;
++    int claim_rc;
++    hook_err_t rc;
++
++    if (!route) return -HOOK_BAD_ADDRESS;
++    claim_rc = syscall_hook_route_begin_remove(route, &claim);
++    if (claim_rc) return claim_rc == -2 ? -HOOK_READER_BUSY
++                                       : -HOOK_NOT_FOUND;
++    if (claim.backend == SYSCALL_HOOK_FUNCTION_POINTER)
++        rc = fp_hook_unwrap_checked(claim.target, before, after);
++    else
++        rc = hook_unwrap_remove_checked(
++            (void *)claim.target, before, after, 1);
++    syscall_hook_route_finish_remove(route);
++    return rc;
++}
+ 
+ uintptr_t *sys_call_table = 0;
+ KP_EXPORT_SYMBOL(sys_call_table);
+@@ -281,18 +347,26 @@ hook_err_t fp_wrap_syscalln(int nr, int narg, int is_compat, void *before, void
+ }
+ KP_EXPORT_SYMBOL(fp_wrap_syscalln);
+ 
+-void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
++hook_err_t fp_unwrap_syscalln_checked(int nr, int is_compat, void *before,
++                                      void *after)
+ {
+     if (!is_compat) {
+-        if (!sys_call_table) return;
++        if (!sys_call_table) return -HOOK_BAD_ADDRESS;
+         uintptr_t fp_addr = (uintptr_t)(sys_call_table + nr);
+-        fp_hook_unwrap(fp_addr, before, after);
++        return fp_hook_unwrap_checked(fp_addr, before, after);
+     } else {
+-        if (!compat_sys_call_table) return;
++        if (!compat_sys_call_table) return -HOOK_BAD_ADDRESS;
+         uintptr_t fp_addr = (uintptr_t)(compat_sys_call_table + nr);
+-        fp_hook_unwrap(fp_addr, before, after);
++        return fp_hook_unwrap_checked(fp_addr, before, after);
+     }
+ }
++KP_EXPORT_SYMBOL(fp_unwrap_syscalln_checked);
++
++void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
++{
++    hook_err_t rc = fp_unwrap_syscalln_checked(nr, is_compat, before, after);
++    if (rc) logke("fp syscall unwrap deferred/failed rc=%d\n", rc);
++}
+ KP_EXPORT_SYMBOL(fp_unwrap_syscalln);
+ 
+ /*
+@@ -310,43 +384,68 @@ hook_err_t inline_wrap_syscalln(int nr, int narg, int is_compat, void *before, v
+ }
+ KP_EXPORT_SYMBOL(inline_wrap_syscalln);
+ 
+-void inline_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
++hook_err_t inline_unwrap_syscalln_checked(int nr, int is_compat, void *before,
++                                          void *after)
+ {
+     uintptr_t addr = syscalln_name_addr(nr, is_compat);
+-    hook_unwrap((void *)addr, before, after);
++    if (!addr) return -HOOK_BAD_ADDRESS;
++    return hook_unwrap_remove_checked((void *)addr, before, after, 1);
++}
++KP_EXPORT_SYMBOL(inline_unwrap_syscalln_checked);
++
++void inline_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
++{
++    hook_err_t rc = inline_unwrap_syscalln_checked(
++        nr, is_compat, before, after);
++    if (rc) logke("inline syscall unwrap deferred/failed rc=%d\n", rc);
+ }
+ KP_EXPORT_SYMBOL(inline_unwrap_syscalln);
+ 
+ hook_err_t hook_syscalln(int nr, int narg, void *before, void *after, void *udata)
+ {
+-    if (sys_call_table) return fp_wrap_syscalln(nr, narg, 0, before, after, udata);
+-    return inline_wrap_syscalln(nr, narg, 0, before, after, udata);
++    return syscall_wrap_recorded(nr, narg, 0, before, after, udata);
+ }
+ KP_EXPORT_SYMBOL(hook_syscalln);
+ 
++hook_err_t unhook_syscalln_checked(int nr, void *before, void *after)
++{
++    return syscall_unwrap_recorded(nr, 0, before, after);
++}
++KP_EXPORT_SYMBOL(unhook_syscalln_checked);
++
+ void unhook_syscalln(int nr, void *before, void *after)
+ {
+-    if (sys_call_table) return fp_unwrap_syscalln(nr, 0, before, after);
+-    return inline_unwrap_syscalln(nr, 0, before, after);
++    hook_err_t rc = unhook_syscalln_checked(nr, before, after);
++    if (rc) logke("syscall unhook deferred/failed rc=%d\n", rc);
+ }
+ KP_EXPORT_SYMBOL(unhook_syscalln);
+ 
+ hook_err_t hook_compat_syscalln(int nr, int narg, void *before, void *after, void *udata)
+ {
+-    if (compat_sys_call_table) return fp_wrap_syscalln(nr, narg, 1, before, after, udata);
+-    return inline_wrap_syscalln(nr, narg, 1, before, after, udata);
++    return syscall_wrap_recorded(nr, narg, 1, before, after, udata);
+ }
+ KP_EXPORT_SYMBOL(hook_compat_syscalln);
+ 
++hook_err_t unhook_compat_syscalln_checked(int nr, void *before, void *after)
++{
++    return syscall_unwrap_recorded(nr, 1, before, after);
++}
++KP_EXPORT_SYMBOL(unhook_compat_syscalln_checked);
++
+ void unhook_compat_syscalln(int nr, void *before, void *after)
+ {
+-    if (compat_sys_call_table) return fp_unwrap_syscalln(nr, 1, before, after);
+-    return inline_unwrap_syscalln(nr, 1, before, after);
++    hook_err_t rc = unhook_compat_syscalln_checked(nr, before, after);
++    if (rc) logke("compat syscall unhook deferred/failed rc=%d\n", rc);
+ }
+ KP_EXPORT_SYMBOL(unhook_compat_syscalln);
+ 
+ void syscall_init()
+ {
++    for (int i = 0; i < SYSCALL_ROUTE_COUNT; i++) {
++        syscall_hook_route_reset(&syscall_routes[i]);
++        syscall_hook_route_reset(&compat_syscall_routes[i]);
++    }
++
+     for (int i = 0; i < sizeof(syscall_name_table) / sizeof(syscall_name_table[0]); i++) {
+         uintptr_t *addr = (uintptr_t *)&syscall_name_table[i].name;
+         *addr = link2runtime(*addr);
+diff --git a/kernel/patch/include/module.h b/kernel/patch/include/module.h
+index 08e875555428e96bfd2e48a5518aa370ec4eec24..6d1c127bd1c60afa6109e7d7106b5d6835d498cf 100644
+--- a/kernel/patch/include/module.h
++++ b/kernel/patch/include/module.h
+@@ -8,6 +8,7 @@
+ 
+ #include <asm-generic/module.h>
+ #include <kpmodule.h>
++#include <module_lifecycle.h>
+ 
+ struct load_info
+ {
+@@ -49,6 +50,11 @@ struct module
+     void *start;
+ 
+     struct list_head list;
++
++    /* Protected by module_lock.  A failed init/exit keeps the allocation in
++     * the table so the exact exit routine can be retried without freeing live
++     * module text. */
++    struct module_lifecycle lifecycle;
+ };
+ 
+ long load_module(const void *data, int len, const char *args, const char *event, void *__user reserved);
+@@ -56,10 +62,13 @@ long load_module_path(const char *path, const char *args, void *__user reserved)
+ long module_control0(const char *name, const char *ctl_args, char *__user out_msg, int outlen);
+ long module_control1(const char *name, void *a1, void *a2, void *a3);
+ long unload_module(const char *name, void *__user reserved);
++/* Legacy non-owning lookup.  The caller must hold rcu_read_lock() until it
++ * stops dereferencing the returned module.  New code should use control/info
++ * APIs, which hold explicit active-call references. */
+ struct module *find_module(const char *name);
+ 
+ int get_module_nums();
+ int list_modules(char *out_names, int size);
+ int get_module_info(const char *name, char *out_info, int size);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/patch/include/module_lifecycle.h b/kernel/patch/include/module_lifecycle.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..207bb9b3de91b213547e3855368a13568df9ae79
+--- /dev/null
++++ b/kernel/patch/include/module_lifecycle.h
+@@ -0,0 +1,142 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef _KP_MODULE_LIFECYCLE_H_
++#define _KP_MODULE_LIFECYCLE_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++enum module_lifecycle_state
++{
++    MODULE_STATE_LOADING = 0,
++    MODULE_STATE_LIVE,
++    MODULE_STATE_EXITING,
++    MODULE_STATE_EXIT_FAILED,
++    MODULE_STATE_RETIRING,
++    MODULE_STATE_EXIT_DONE,
++};
++
++struct module_lifecycle
++{
++    enum module_lifecycle_state state;
++    unsigned int active_calls;
++    int control_busy;
++    uintptr_t control_owner;
++    long init_error;
++    long exit_error;
++};
++
++static inline void module_lifecycle_init(struct module_lifecycle *lifecycle)
++{
++    lifecycle->state = MODULE_STATE_LOADING;
++    lifecycle->active_calls = 0;
++    lifecycle->control_busy = 0;
++    lifecycle->control_owner = 0;
++    lifecycle->init_error = 0;
++    lifecycle->exit_error = 0;
++}
++
++static inline bool module_lifecycle_try_get_control(
++    struct module_lifecycle *lifecycle, uintptr_t owner)
++{
++    if (lifecycle->state != MODULE_STATE_LIVE || lifecycle->control_busy)
++        return false;
++    lifecycle->control_busy = 1;
++    lifecycle->control_owner = owner;
++    lifecycle->active_calls++;
++    return true;
++}
++
++static inline bool module_lifecycle_put_control(
++    struct module_lifecycle *lifecycle)
++{
++    lifecycle->control_busy = 0;
++    lifecycle->control_owner = 0;
++    if (!lifecycle->active_calls) return false;
++    lifecycle->active_calls--;
++    return true;
++}
++
++static inline bool module_lifecycle_is_control_owner(
++    const struct module_lifecycle *lifecycle, uintptr_t owner)
++{
++    return lifecycle->control_busy && lifecycle->control_owner == owner;
++}
++
++static inline bool module_lifecycle_try_get_info(
++    struct module_lifecycle *lifecycle)
++{
++    if (lifecycle->state != MODULE_STATE_LIVE &&
++        lifecycle->state != MODULE_STATE_EXIT_FAILED)
++        return false;
++    lifecycle->active_calls++;
++    return true;
++}
++
++static inline bool module_lifecycle_put_info(
++    struct module_lifecycle *lifecycle)
++{
++    if (!lifecycle->active_calls) return false;
++    lifecycle->active_calls--;
++    return true;
++}
++
++static inline bool module_lifecycle_begin_unload(
++    struct module_lifecycle *lifecycle,
++    enum module_lifecycle_state *previous_state,
++    bool *exit_already_done)
++{
++    if (lifecycle->state != MODULE_STATE_LIVE &&
++        lifecycle->state != MODULE_STATE_EXIT_FAILED &&
++        lifecycle->state != MODULE_STATE_EXIT_DONE)
++        return false;
++    *previous_state = lifecycle->state;
++    *exit_already_done = lifecycle->state == MODULE_STATE_EXIT_DONE;
++    lifecycle->state = MODULE_STATE_EXITING;
++    return true;
++}
++
++static inline void module_lifecycle_restore(
++    struct module_lifecycle *lifecycle,
++    enum module_lifecycle_state previous_state,
++    long error)
++{
++    lifecycle->state = previous_state;
++    lifecycle->exit_error = error;
++}
++
++static inline void module_lifecycle_mark_live(
++    struct module_lifecycle *lifecycle)
++{
++    lifecycle->state = MODULE_STATE_LIVE;
++    lifecycle->exit_error = 0;
++}
++
++static inline void module_lifecycle_mark_exit_failed(
++    struct module_lifecycle *lifecycle, long error)
++{
++    lifecycle->state = MODULE_STATE_EXIT_FAILED;
++    lifecycle->exit_error = error;
++}
++
++static inline void module_lifecycle_mark_exit_done(
++    struct module_lifecycle *lifecycle)
++{
++    lifecycle->state = MODULE_STATE_EXIT_DONE;
++    lifecycle->exit_error = 0;
++}
++
++static inline void module_lifecycle_mark_retiring(
++    struct module_lifecycle *lifecycle)
++{
++    lifecycle->state = MODULE_STATE_RETIRING;
++    lifecycle->exit_error = 0;
++}
++
++static inline bool module_lifecycle_is_idle(
++    const struct module_lifecycle *lifecycle)
++{
++    return lifecycle->active_calls == 0;
++}
++
++#endif
+diff --git a/kernel/patch/include/syscall.h b/kernel/patch/include/syscall.h
+index a20bfc7f12a69b2ce3d1bfd542b520bfa173e074..ac9238c5f69c22db6a2eab020ed0345ffc40391c 100644
+--- a/kernel/patch/include/syscall.h
++++ b/kernel/patch/include/syscall.h
+@@ -13,6 +13,8 @@
+ #include <uapi/asm-generic/unistd.h>
+ 
+ extern int has_syscall_wrapper;
++extern uintptr_t *sys_call_table;
++extern uintptr_t *compat_sys_call_table;
+ extern struct
+ {
+     const char *name;
+@@ -92,6 +94,8 @@ hook_err_t fp_wrap_syscalln(int nr, int narg, int is_compat, void *before, void
+  * @param after 
+  */
+ void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after);
++hook_err_t fp_unwrap_syscalln_checked(int nr, int is_compat, void *before,
++                                      void *after);
+ 
+ static inline hook_err_t fp_hook_syscalln(int nr, int narg, void *before, void *after, void *udata)
+ {
+@@ -135,6 +139,8 @@ hook_err_t inline_wrap_syscalln(int nr, int narg, int is_compat, void *before, v
+  * @param after 
+  */
+ void inline_unwrap_syscalln(int nr, int is_compat, void *before, void *after);
++hook_err_t inline_unwrap_syscalln_checked(int nr, int is_compat, void *before,
++                                          void *after);
+ 
+ static inline hook_err_t inline_hook_syscalln(int nr, int narg, void *before, void *after, void *udata)
+ {
+@@ -161,9 +167,11 @@ static inline void inline_unhook_compat_syscalln(int nr, void *before, void *aft
+ hook_err_t hook_syscalln(int nr, int narg, void *before, void *after, void *udata);
+ 
+ void unhook_syscalln(int nr, void *before, void *after);
++hook_err_t unhook_syscalln_checked(int nr, void *before, void *after);
+ 
+ hook_err_t hook_compat_syscalln(int nr, int narg, void *before, void *after, void *udata);
+ 
+ void unhook_compat_syscalln(int nr, void *before, void *after);
++hook_err_t unhook_compat_syscalln_checked(int nr, void *before, void *after);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/kernel/patch/include/syscall_route.h b/kernel/patch/include/syscall_route.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cebc6a1f79858e61fc1c1fc45e0b0c7b45aa6ee6
+--- /dev/null
++++ b/kernel/patch/include/syscall_route.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef _KP_SYSCALL_ROUTE_H_
++#define _KP_SYSCALL_ROUTE_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++enum syscall_hook_backend
++{
++    SYSCALL_HOOK_NONE = 0,
++    SYSCALL_HOOK_FUNCTION_POINTER,
++    SYSCALL_HOOK_INLINE,
++};
++
++enum syscall_hook_route_state
++{
++    SYSCALL_ROUTE_UNBOUND = 0,
++    SYSCALL_ROUTE_BOUND,
++    SYSCALL_ROUTE_INSTALLING,
++    SYSCALL_ROUTE_REMOVING,
++};
++
++struct syscall_hook_route
++{
++    volatile int32_t state;
++    enum syscall_hook_backend backend;
++    uintptr_t target;
++};
++
++struct syscall_hook_route_claim
++{
++    enum syscall_hook_backend backend;
++    uintptr_t target;
++    int was_bound;
++};
++
++static inline int syscall_hook_route_begin_install(
++    struct syscall_hook_route *route, uintptr_t fp_target,
++    uintptr_t inline_target, struct syscall_hook_route_claim *claim)
++{
++    int32_t expected;
++    enum syscall_hook_backend backend;
++    uintptr_t target;
++
++    if (!route || !claim) return -1;
++    expected = __atomic_load_n(&route->state, __ATOMIC_ACQUIRE);
++    if (expected == SYSCALL_ROUTE_BOUND) {
++        if (!__atomic_compare_exchange_n(
++                &route->state, &expected, SYSCALL_ROUTE_INSTALLING, false,
++                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            return -2;
++        if (route->backend == SYSCALL_HOOK_NONE || !route->target) {
++            __atomic_store_n(&route->state, SYSCALL_ROUTE_BOUND,
++                             __ATOMIC_RELEASE);
++            return -1;
++        }
++        claim->backend = route->backend;
++        claim->target = route->target;
++        claim->was_bound = 1;
++        return 0;
++    }
++    if (expected != SYSCALL_ROUTE_UNBOUND) return -2;
++    if (fp_target) {
++        backend = SYSCALL_HOOK_FUNCTION_POINTER;
++        target = fp_target;
++    } else if (inline_target) {
++        backend = SYSCALL_HOOK_INLINE;
++        target = inline_target;
++    } else {
++        return -1;
++    }
++    if (!__atomic_compare_exchange_n(
++            &route->state, &expected, SYSCALL_ROUTE_INSTALLING, false,
++            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++        return -2;
++    route->backend = backend;
++    route->target = target;
++    claim->backend = backend;
++    claim->target = target;
++    claim->was_bound = 0;
++    return 0;
++}
++
++static inline void syscall_hook_route_finish_install(
++    struct syscall_hook_route *route,
++    const struct syscall_hook_route_claim *claim, int success)
++{
++    if (!success && !claim->was_bound) {
++        route->target = 0;
++        route->backend = SYSCALL_HOOK_NONE;
++        __atomic_store_n(&route->state, SYSCALL_ROUTE_UNBOUND,
++                         __ATOMIC_RELEASE);
++        return;
++    }
++    __atomic_store_n(&route->state, SYSCALL_ROUTE_BOUND,
++                     __ATOMIC_RELEASE);
++}
++
++static inline int syscall_hook_route_begin_remove(
++    struct syscall_hook_route *route, struct syscall_hook_route_claim *claim)
++{
++    int32_t expected = SYSCALL_ROUTE_BOUND;
++    if (!route || !claim) return -1;
++    if (!__atomic_compare_exchange_n(
++            &route->state, &expected, SYSCALL_ROUTE_REMOVING, false,
++            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++        return expected == SYSCALL_ROUTE_UNBOUND ? -1 : -2;
++    if (route->backend == SYSCALL_HOOK_NONE || !route->target) {
++        __atomic_store_n(&route->state, SYSCALL_ROUTE_BOUND,
++                         __ATOMIC_RELEASE);
++        return -1;
++    }
++    claim->backend = route->backend;
++    claim->target = route->target;
++    claim->was_bound = 1;
++    return 0;
++}
++
++static inline void syscall_hook_route_finish_remove(
++    struct syscall_hook_route *route)
++{
++    __atomic_store_n(&route->state, SYSCALL_ROUTE_BOUND,
++                     __ATOMIC_RELEASE);
++}
++
++static inline void syscall_hook_route_reset(struct syscall_hook_route *route)
++{
++    route->target = 0;
++    route->backend = SYSCALL_HOOK_NONE;
++    __atomic_store_n(&route->state, SYSCALL_ROUTE_UNBOUND,
++                     __ATOMIC_RELEASE);
++}
++
++#endif
+diff --git a/kernel/patch/module/module.c b/kernel/patch/module/module.c
+index 087cd4bf5f43cc53216a46db409f6ee8fc7576fe..0a467a7541508869eae0472ccf979ff94760ca90 100644
+--- a/kernel/patch/module/module.c
++++ b/kernel/patch/module/module.c
+@@ -15,6 +15,7 @@
+ #include <linux/fs.h>
+ #include <uapi/linux/fs.h>
+ #include <hotpatch.h>
++#include <asm/current.h>
+ #include <linux/list.h>
+ #include <linux/kernel.h>
+ #include <linux/spinlock.h>
+@@ -22,6 +23,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/rcupdate.h>
+ #include <linux/rculist.h>
++#include <hook.h>
+ 
+ #include "module.h"
+ #include "relo.h"
+@@ -395,24 +397,121 @@ static int elf_header_check(struct load_info *info)
+ struct module modules = { 0 };
+ static spinlock_t module_lock;
+ 
++static struct module *find_module_locked(const char *name)
++{
++    struct module *pos;
++    list_for_each_entry(pos, &modules.list, list)
++    {
++        if (!strcmp(name, pos->info.name)) return pos;
++    }
++    return 0;
++}
++
++struct module *find_module(const char *name)
++{
++    struct module *mod;
++    if (!name) return 0;
++    list_for_each_entry_rcu(mod, &modules.list, list) {
++        if (!strcmp(name, mod->info.name)) return mod;
++    }
++    return 0;
++}
++
++static struct module *module_get_live(const char *name, long *error)
++{
++    struct module *mod;
++
++    spin_lock(&module_lock);
++    mod = find_module_locked(name);
++    if (!mod) {
++        *error = -ENOENT;
++    } else if (!module_lifecycle_try_get_control(
++                   &mod->lifecycle, (uintptr_t)current)) {
++        *error = -EBUSY;
++        mod = 0;
++    } else {
++        *error = 0;
++    }
++    spin_unlock(&module_lock);
++    return mod;
++}
++
++static void module_put(struct module *mod)
++{
++    spin_lock(&module_lock);
++    if (!module_lifecycle_put_control(&mod->lifecycle)) {
++        spin_unlock(&module_lock);
++        logkfe("module active call underflow: %s\n", mod->info.name);
++        return;
++    }
++    spin_unlock(&module_lock);
++}
++
++static int module_wait_idle(struct module *mod)
++{
++    /* Exit is now outside an RCU read-side section.  Keep the wait bounded:
++     * a module callback that does not return must retain its text and make the
++     * caller retry unload instead of freezing a CPU or freeing live code. */
++    for (unsigned int i = 0; i < 10000000; i++) {
++        unsigned int active;
++        spin_lock(&module_lock);
++        active = mod->lifecycle.active_calls;
++        spin_unlock(&module_lock);
++        if (!active) return 0;
++        asm volatile("yield" ::: "memory");
++    }
++    return -EBUSY;
++}
++
++static void module_destroy(struct module *mod)
++{
++    if (mod->args) kvfree(mod->args);
++    if (mod->ctl_args) kvfree(mod->ctl_args);
++    kp_free_exec(mod->start);
++    kvfree(mod);
++}
++
++static int module_retire(struct module *mod)
++{
++    if (!kfunc(synchronize_rcu)) return -ENOSYS;
++    spin_lock(&module_lock);
++    list_del_rcu(&mod->list);
++    spin_unlock(&module_lock);
++    synchronize_rcu();
++    return 0;
++}
++
++static long module_call_exit(struct module *mod, void *__user reserved)
++{
++    for (unsigned int attempt = 0; attempt < 16; attempt++) {
++        long rc = (*mod->exit)(reserved);
++        if (rc == -(long)HOOK_DEFERRED ||
++            rc == -(long)HOOK_READER_BUSY) {
++            if (hook_cleanup_pending() && hook_cleanup_drain()) return rc;
++            continue;
++        }
++        if (rc) return rc;
++        if (!hook_cleanup_pending()) return 0;
++        if (hook_cleanup_drain()) return -EBUSY;
++    }
++    return -EBUSY;
++}
++
+ long load_module(const void *data, int len, const char *args, const char *event, void *__user reserved)
+ {
+     struct load_info load_info = { .len = len, .hdr = data };
+     struct load_info *info = &load_info;
+     long rc = 0;
+ 
++    if (!hook_management_context_ok()) return -EBUSY;
++
+     if ((rc = elf_header_check(info))) goto out;
+     if ((rc = setup_load_info(info))) goto out;
+ 
+-    if (find_module(info->info.name)) {
+-        logkfd("%s exist\n", info->info.name);
+-        rc = -EEXIST;
+-        goto out;
+-    }
+-
+     struct module *mod = (struct module *)vmalloc(sizeof(struct module));
+     if (!mod) return -ENOMEM;
+     memset(mod, 0, sizeof(struct module));
++    module_lifecycle_init(&mod->lifecycle);
+ 
+     if (args) {
+         mod->args = vmalloc(strlen(args) + 1);
+@@ -432,15 +531,77 @@ long load_module(const void *data, int len, const char *args, const char *event,
+ 
+     flush_icache_all();
+ 
++    /* Reserve the name before init so concurrent loads cannot both publish
++     * the same module.  LOADING entries are visible to list/info but reject
++     * control and unload until init reaches a terminal state. */
++    spin_lock(&module_lock);
++    if (find_module_locked(mod->info.name)) {
++        spin_unlock(&module_lock);
++        logkfd("%s exist\n", mod->info.name);
++        rc = -EEXIST;
++        goto free;
++    }
++    INIT_LIST_HEAD(&mod->list);
++    list_add_tail_rcu(&mod->list, &modules.list);
++    spin_unlock(&module_lock);
++
+     rc = (*mod->init)(mod->args, event, reserved);
+ 
+     if (!rc) {
++        spin_lock(&module_lock);
++        module_lifecycle_mark_live(&mod->lifecycle);
++        spin_unlock(&module_lock);
+         logkfi("[%s] succeed with [%s] \n", mod->info.name, args);
+-        list_add_tail(&mod->list, &modules.list);
+         goto out;
+     } else {
++        long exit_rc;
++        long idle_rc;
++        spin_lock(&module_lock);
++        mod->lifecycle.init_error = rc;
++        spin_unlock(&module_lock);
+         logkfi("[%s] failed with [%s] error: %d, try exit ...\n", mod->info.name, args, rc);
+-        (*mod->exit)(reserved);
++        exit_rc = module_call_exit(mod, reserved);
++        if (exit_rc) {
++            spin_lock(&module_lock);
++            module_lifecycle_mark_exit_failed(&mod->lifecycle, exit_rc);
++            spin_unlock(&module_lock);
++            logkfe("[%s] init rollback failed: %ld; module retained for unload retry\n",
++                   mod->info.name, exit_rc);
++            goto out;
++        }
++        if (hook_cleanup_pending()) {
++            spin_lock(&module_lock);
++            module_lifecycle_mark_exit_failed(&mod->lifecycle, -EBUSY);
++            spin_unlock(&module_lock);
++            logkfe("[%s] init rollback left deferred hooks; module retained\n",
++                   mod->info.name);
++            goto out;
++        }
++        spin_lock(&module_lock);
++        module_lifecycle_mark_retiring(&mod->lifecycle);
++        spin_unlock(&module_lock);
++        idle_rc = module_wait_idle(mod);
++        if (idle_rc) {
++            spin_lock(&module_lock);
++            module_lifecycle_mark_exit_done(&mod->lifecycle);
++            mod->lifecycle.exit_error = idle_rc;
++            spin_unlock(&module_lock);
++            logkfe("[%s] init rollback completed but references remain rc=%ld; module retained\n",
++                   mod->info.name, idle_rc);
++            goto out;
++        }
++        idle_rc = module_retire(mod);
++        if (idle_rc) {
++            spin_lock(&module_lock);
++            module_lifecycle_mark_exit_done(&mod->lifecycle);
++            mod->lifecycle.exit_error = idle_rc;
++            spin_unlock(&module_lock);
++            logkfe("[%s] ordinary RCU grace unavailable rc=%ld; module retained\n",
++                   mod->info.name, idle_rc);
++            goto out;
++        }
++        module_destroy(mod);
++        goto out;
+     }
+ 
+ free:
+@@ -452,33 +613,95 @@ out:
+     return rc;
+ }
+ 
+-// todo: lock
+ long unload_module(const char *name, void *__user reserved)
+ {
+     if (!name) return -EINVAL;
++    if (!hook_management_context_ok()) return -EBUSY;
+     logkfe("name: %s\n", name);
+ 
+-    rcu_read_lock();
+     long rc = 0;
++    enum module_lifecycle_state previous_state;
++    bool exit_already_done;
+ 
+-    struct module *mod = find_module(name);
++    spin_lock(&module_lock);
++    struct module *mod = find_module_locked(name);
+     if (!mod) {
+-        rc = -ENOENT;
+-        goto out;
++        spin_unlock(&module_lock);
++        return -ENOENT;
+     }
+-    list_del(&mod->list);
+-    rc = (*mod->exit)(reserved);
+ 
+-    if (mod->args) kvfree(mod->args);
+-    if (mod->ctl_args) kvfree(mod->ctl_args);
++    if (module_lifecycle_is_control_owner(
++            &mod->lifecycle, (uintptr_t)current)) {
++        spin_unlock(&module_lock);
++        return -EBUSY;
++    }
+ 
+-    kp_free_exec(mod->start);
+-    kvfree(mod);
++    if (!module_lifecycle_begin_unload(&mod->lifecycle, &previous_state,
++                                       &exit_already_done)) {
++        spin_unlock(&module_lock);
++        return -EBUSY;
++    }
++    spin_unlock(&module_lock);
+ 
+-    logkfi("name: %s, rc: %d\n", name, rc);
++    rc = module_wait_idle(mod);
++    if (rc) {
++        spin_lock(&module_lock);
++        module_lifecycle_restore(&mod->lifecycle, previous_state, rc);
++        spin_unlock(&module_lock);
++        logkfe("name: %s has active calls; unload retained rc=%ld\n",
++               name, rc);
++        return rc;
++    }
+ 
+-out:
+-    rcu_read_unlock();
++    /* Deliberately outside rcu_read_lock and module_lock: exit may need a
++     * grace period or bounded wait.  The EXITING state prevents new calls. */
++    if (!exit_already_done) {
++        rc = module_call_exit(mod, reserved);
++        if (rc) {
++            spin_lock(&module_lock);
++            module_lifecycle_mark_exit_failed(&mod->lifecycle, rc);
++            spin_unlock(&module_lock);
++            logkfe("name: %s exit failed rc=%ld; module text retained for retry\n",
++                   name, rc);
++            return rc;
++        }
++    }
++
++    if (hook_cleanup_pending()) {
++        spin_lock(&module_lock);
++        module_lifecycle_mark_exit_failed(&mod->lifecycle, -EBUSY);
++        spin_unlock(&module_lock);
++        logkfe("name: %s exit left deferred hooks; module text retained\n",
++               name);
++        return -EBUSY;
++    }
++
++    spin_lock(&module_lock);
++    module_lifecycle_mark_retiring(&mod->lifecycle);
++    spin_unlock(&module_lock);
++    rc = module_wait_idle(mod);
++    if (rc) {
++        spin_lock(&module_lock);
++        module_lifecycle_mark_exit_done(&mod->lifecycle);
++        mod->lifecycle.exit_error = rc;
++        spin_unlock(&module_lock);
++        logkfe("name: %s exit completed but references remain rc=%ld; module retained\n",
++               name, rc);
++        return rc;
++    }
++    rc = module_retire(mod);
++    if (rc) {
++        spin_lock(&module_lock);
++        module_lifecycle_mark_exit_done(&mod->lifecycle);
++        mod->lifecycle.exit_error = rc;
++        spin_unlock(&module_lock);
++        logkfe("name: %s ordinary RCU grace unavailable rc=%ld; module retained\n",
++               name, rc);
++        return rc;
++    }
++    module_destroy(mod);
++
++    logkfi("name: %s, rc: %ld\n", name, rc);
+     return rc;
+ }
+ 
+@@ -487,6 +710,7 @@ long load_module_path(const char *path, const char *args, void *__user reserved)
+     long rc = 0;
+     logkfd("%s\n", path);
+     if (!path) return -EINVAL;
++    if (!hook_management_context_ok()) return -EBUSY;
+ 
+     struct file *filp = filp_open(path, O_RDONLY, 0);
+     if (unlikely(!filp || IS_ERR(filp))) {
+@@ -525,24 +749,20 @@ out:
+ long module_control0(const char *name, const char *ctl_args, char *__user out_msg, int outlen)
+ {
+     if (!name || !ctl_args) return -EINVAL;
++    if (!hook_management_context_ok()) return -EBUSY;
+     int args_len = strlen(ctl_args);
+     if (args_len <= 0) return -EINVAL;
+ 
+     logkfi("name %s, args: %s\n", name, ctl_args);
+ 
+     long rc = 0;
+-    rcu_read_lock();
+-
+-    struct module *mod = find_module(name);
+-    if (!mod) {
+-        rc = -ENOENT;
+-        goto out;
+-    }
++    struct module *mod = module_get_live(name, &rc);
++    if (!mod) return rc;
+ 
+     if (!*mod->ctl0) {
+         logkfe("no ctl0\n");
+         rc = -ENOSYS;
+-        goto out;
++        goto put;
+     }
+ 
+     if (mod->ctl_args) kvfree(mod->ctl_args);
+@@ -550,68 +770,52 @@ long module_control0(const char *name, const char *ctl_args, char *__user out_ms
+     mod->ctl_args = vmalloc(args_len + 1);
+     if (!mod->ctl_args) {
+         rc = -ENOMEM;
+-        goto out;
++        goto put;
+     }
+ 
+     strcpy(mod->ctl_args, ctl_args);
+ 
+     rc = (*mod->ctl0)(mod->ctl_args, out_msg, outlen);
+ 
+-    logkfi("name: %s, rc: %d\n", name, rc);
+-out:
+-    rcu_read_unlock();
++    logkfi("name: %s, rc: %ld\n", name, rc);
++put:
++    module_put(mod);
+     return rc;
+ }
+ 
+ long module_control1(const char *name, void *a1, void *a2, void *a3)
+ {
++    if (!name) return -EINVAL;
++    if (!hook_management_context_ok()) return -EBUSY;
+     logkfi("name %s, a1: %llx, a2: %llx, a3: %llx\n", name, a1, a2, a3);
+     long rc = 0;
+-    rcu_read_lock();
+-
+-    struct module *mod = find_module(name);
+-    if (!mod) {
+-        rc = -ENOENT;
+-        goto out;
+-    }
++    struct module *mod = module_get_live(name, &rc);
++    if (!mod) return rc;
+ 
+     if (!*mod->ctl1) {
+         logkfe("no ctl1\n");
+         rc = -ENOSYS;
+-        goto out;
++        goto put;
+     }
+ 
+     rc = (*mod->ctl1)(a1, a2, a3);
+ 
+-    logkfi("name: %s, rc: %d\n", name, rc);
+-out:
+-    rcu_read_unlock();
++    logkfi("name: %s, rc: %ld\n", name, rc);
++put:
++    module_put(mod);
+     return rc;
+ }
+ 
+-struct module *find_module(const char *name)
+-{
+-    struct module *pos;
+-    list_for_each_entry(pos, &modules.list, list)
+-    {
+-        if (!strcmp(name, pos->info.name)) {
+-            return pos;
+-        }
+-    }
+-    return 0;
+-}
+-
+ int get_module_nums()
+ {
+-    rcu_read_lock();
+-
+     struct module *pos;
+     int n = 0;
++    spin_lock(&module_lock);
+     list_for_each_entry(pos, &modules.list, list)
+     {
+         n++;
+     }
+-    rcu_read_unlock();
++    spin_unlock(&module_lock);
+ 
+     logkfd("%d\n", n);
+     return n;
+@@ -619,27 +823,47 @@ int get_module_nums()
+ 
+ int list_modules(char *out_names, int size)
+ {
+-    rcu_read_lock();
++    if (!out_names || size <= 0) return -EINVAL;
+ 
+     struct module *pos;
+     int off = 0;
++    spin_lock(&module_lock);
+     list_for_each_entry(pos, &modules.list, list)
+     {
+-        off += snprintf(out_names + off, size - 1 - off, "%s\n", pos->info.name);
++        int written;
++        int remaining;
++        if (off >= size - 1) break;
++        remaining = size - off;
++        written = snprintf(out_names + off, remaining, "%s\n",
++                           pos->info.name);
++        if (written < 0) break;
++        if (written >= remaining) {
++            off = size - 1;
++            break;
++        }
++        off += written;
+     }
+     if (off > 0) out_names[off - 1] = '\0';
+-
+-    rcu_read_unlock();
++    spin_unlock(&module_lock);
+     return off;
+ }
+ 
+ int get_module_info(const char *name, char *out_info, int size)
+ {
+     if (size <= 0) return 0;
+-    rcu_read_lock();
++    if (!name || !out_info) return -EINVAL;
+ 
+-    struct module *mod = find_module(name);
+-    if (!mod) return -ENOENT;
++    spin_lock(&module_lock);
++    struct module *mod = find_module_locked(name);
++    if (!mod) {
++        spin_unlock(&module_lock);
++        return -ENOENT;
++    }
++    if (!module_lifecycle_try_get_info(&mod->lifecycle)) {
++        spin_unlock(&module_lock);
++        return -EBUSY;
++    }
++    spin_unlock(&module_lock);
+ 
+     int sz = snprintf(out_info, size - 1,
+                       "name=%s\n"
+@@ -651,10 +875,19 @@ int get_module_info(const char *name, char *out_info, int size)
+                       mod->info.name, mod->info.version, mod->info.license, mod->info.author, mod->info.description,
+                       mod->args);
+ 
+-    if (sz > 0) out_info[sz - 1] = '\0';
++    if (sz > 0) {
++        int terminator = sz - 1;
++        if (terminator >= size - 1) terminator = size - 2;
++        if (terminator >= 0) out_info[terminator] = '\0';
++    }
+     logkfd("%s", out_info);
+-
+-    rcu_read_unlock();
++    spin_lock(&module_lock);
++    if (!module_lifecycle_put_info(&mod->lifecycle)) {
++        spin_unlock(&module_lock);
++        logkfe("module info reference underflow: %s\n", name);
++        return -EIO;
++    }
++    spin_unlock(&module_lock);
+     return sz;
+ }
+ 
+@@ -662,4 +895,4 @@ void module_init()
+ {
+     INIT_LIST_HEAD(&modules.list);
+     spin_lock_init(&module_lock);
+-}
+\ No newline at end of file
++}
+diff --git a/tests/test_hook_lifecycle.c b/tests/test_hook_lifecycle.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b1c4de32a0e807c80b3caae6179f80ab0ddbfa5
+--- /dev/null
++++ b/tests/test_hook_lifecycle.c
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "../kernel/include/hook_lifecycle.h"
++
++#define CHECK(condition)                                                        \
++    do {                                                                        \
++        if (!(condition)) {                                                     \
++            fprintf(stderr, "FAIL line=%d expression=%s\n", __LINE__,        \
++                    #condition);                                                \
++            return EXIT_FAILURE;                                                \
++        }                                                                       \
++    } while (0)
++
++static int test_many_hook_exit_drain(void)
++{
++    enum { HOOK_COUNT = 33 };
++    int8_t states[HOOK_COUNT];
++    uint8_t counted[HOOK_COUNT] = {0};
++    volatile int32_t readers[HOOK_COUNT];
++    volatile int32_t debt = 0;
++
++    for (int i = 0; i < HOOK_COUNT; i++) {
++        states[i] = CHAIN_ITEM_STATE_READY;
++        readers[i] = 1;
++        CHECK(hook_item_begin_remove(
++                  &states[i], &counted[i], &readers[i], &debt) ==
++              HOOK_REMOVE_DEFERRED);
++    }
++    CHECK(debt == HOOK_COUNT);
++
++    for (int i = HOOK_COUNT - 1; i >= 0; i--) {
++        readers[i]--;
++        CHECK(hook_item_try_claim_drain(&states[i], &readers[i]));
++        hook_item_finish_remove(&states[i], &counted[i], &debt);
++        if (i != 0) CHECK(debt != 0);
++    }
++    CHECK(debt == 0);
++    for (int i = 0; i < HOOK_COUNT; i++)
++        CHECK(states[i] == CHAIN_ITEM_STATE_EMPTY && counted[i] == 0);
++    return EXIT_SUCCESS;
++}
++
++int main(void)
++{
++    int8_t state = CHAIN_ITEM_STATE_READY;
++    uint8_t counted = 0;
++    volatile int32_t readers = 1;
++    volatile int32_t debt = 0;
++
++    CHECK(hook_item_begin_remove(&state, &counted, &readers, &debt) ==
++          HOOK_REMOVE_DEFERRED);
++    CHECK(state == CHAIN_ITEM_STATE_BUSY);
++    CHECK(counted == 1 && debt == 1);
++    CHECK(hook_item_begin_remove(&state, &counted, &readers, &debt) ==
++          HOOK_REMOVE_DEFERRED);
++    CHECK(debt == 1);
++
++    readers = 0;
++    CHECK(hook_item_begin_remove(&state, &counted, &readers, &debt) ==
++          HOOK_REMOVE_READY);
++    CHECK(state == CHAIN_ITEM_STATE_DRAINING);
++    hook_item_finish_remove(&state, &counted, &debt);
++    CHECK(state == CHAIN_ITEM_STATE_EMPTY);
++    CHECK(counted == 0 && debt == 0);
++
++    state = CHAIN_ITEM_STATE_READY;
++    readers = 1;
++    CHECK(hook_item_begin_remove(&state, &counted, &readers, &debt) ==
++          HOOK_REMOVE_DEFERRED);
++    CHECK(state == CHAIN_ITEM_STATE_BUSY && debt == 1);
++    readers--;
++    CHECK(readers == 0);
++    CHECK(hook_item_try_claim_drain(&state, &readers));
++    hook_item_finish_remove(&state, &counted, &debt);
++    CHECK(state == CHAIN_ITEM_STATE_EMPTY);
++    CHECK(counted == 0 && debt == 0);
++
++    state = CHAIN_ITEM_STATE_READY;
++    CHECK(hook_item_begin_remove(&state, &counted, &readers, &debt) ==
++          HOOK_REMOVE_READY);
++    CHECK(state == CHAIN_ITEM_STATE_DRAINING);
++    hook_item_finish_remove(&state, &counted, &debt);
++    CHECK(debt == 0);
++    CHECK(test_many_hook_exit_drain() == EXIT_SUCCESS);
++    puts("hook_lifecycle_test PASS");
++    return EXIT_SUCCESS;
++}
+diff --git a/tests/test_lifecycle_interleavings.cpp b/tests/test_lifecycle_interleavings.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0f48bf78106cc996bbe3f3d4f281676aa30c398
+--- /dev/null
++++ b/tests/test_lifecycle_interleavings.cpp
+@@ -0,0 +1,338 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++
++#include "../kernel/include/hook_lifecycle.h"
++#include "../kernel/patch/include/module_lifecycle.h"
++#include "../kernel/patch/include/syscall_route.h"
++
++#define CHECK(condition)                                                        \
++    do {                                                                        \
++        if (!(condition)) {                                                     \
++            std::fprintf(stderr, "FAIL line=%d expression=%s\n", __LINE__,    \
++                         #condition);                                           \
++            return EXIT_FAILURE;                                                \
++        }                                                                       \
++    } while (0)
++
++class Barrier {
++public:
++    explicit Barrier(unsigned int count) : threshold_(count), count_(count) {}
++
++    void wait()
++    {
++        std::unique_lock<std::mutex> lock(mutex_);
++        const unsigned int generation = generation_;
++        if (--count_ == 0) {
++            generation_++;
++            count_ = threshold_;
++            cv_.notify_all();
++            return;
++        }
++        cv_.wait(lock, [&] { return generation != generation_; });
++    }
++
++private:
++    std::mutex mutex_;
++    std::condition_variable cv_;
++    const unsigned int threshold_;
++    unsigned int count_;
++    unsigned int generation_ = 0;
++};
++
++struct HookFixture {
++    int8_t state = CHAIN_ITEM_STATE_READY;
++    uint8_t counted = 0;
++    volatile int32_t readers = 1;
++    volatile int32_t debt = 0;
++    void *udata = reinterpret_cast<void *>(1);
++    void *before = reinterpret_cast<void *>(2);
++    void *after = reinterpret_cast<void *>(3);
++};
++
++static int finish_claimed(HookFixture &fixture)
++{
++    fixture.udata = nullptr;
++    fixture.before = nullptr;
++    fixture.after = nullptr;
++    hook_item_finish_remove(
++        &fixture.state, &fixture.counted, &fixture.debt);
++    return fixture.state == CHAIN_ITEM_STATE_EMPTY &&
++           fixture.counted == 0 && fixture.debt == 0 &&
++           fixture.udata == nullptr && fixture.before == nullptr &&
++           fixture.after == nullptr;
++}
++
++using ReaderRelease = int (*)(HookFixture &fixture);
++
++static int inline_reader_release(HookFixture &fixture)
++{
++    return hook_item_reader_release(
++        &fixture.state, &fixture.readers, &fixture.counted, &fixture.debt,
++        &fixture.udata, &fixture.before, &fixture.after);
++}
++
++static int fp_reader_release(HookFixture &fixture)
++{
++    return hook_item_reader_release(
++        &fixture.state, &fixture.readers, &fixture.counted, &fixture.debt,
++        &fixture.udata, &fixture.before, &fixture.after);
++}
++
++static int test_snapshot_cancel_last_reader(ReaderRelease release)
++{
++    HookFixture fixture;
++    fixture.readers = 0;
++    Barrier first_ready_observed(2);
++    Barrier removal_published(2);
++    std::atomic<int> failed{0};
++
++    std::thread snapshot([&] {
++        if (__atomic_load_n(&fixture.state, __ATOMIC_ACQUIRE) !=
++            CHAIN_ITEM_STATE_READY)
++            failed = 1;
++        __atomic_add_fetch(&fixture.readers, 1, __ATOMIC_ACQ_REL);
++        first_ready_observed.wait();
++        removal_published.wait();
++        if (__atomic_load_n(&fixture.state, __ATOMIC_ACQUIRE) ==
++            CHAIN_ITEM_STATE_READY)
++            failed = 1;
++        if (!release(fixture)) failed = 1;
++    });
++    std::thread remover([&] {
++        first_ready_observed.wait();
++        if (hook_item_begin_remove(
++                &fixture.state, &fixture.counted, &fixture.readers,
++                &fixture.debt) != HOOK_REMOVE_DEFERRED)
++            failed = 1;
++        if (fixture.state != CHAIN_ITEM_STATE_BUSY ||
++            fixture.counted != 1 || fixture.debt != 1)
++            failed = 1;
++        removal_published.wait();
++    });
++    snapshot.join();
++    remover.join();
++    CHECK(!failed.load());
++    CHECK(fixture.state == CHAIN_ITEM_STATE_EMPTY);
++    CHECK(fixture.readers == 0 && fixture.debt == 0);
++    CHECK(fixture.udata == nullptr && fixture.before == nullptr &&
++          fixture.after == nullptr);
++    return EXIT_SUCCESS;
++}
++
++static int test_reader_before_debt_publish()
++{
++    HookFixture fixture;
++    Barrier claimed(2);
++    Barrier reader_released(2);
++    std::atomic<int> failed{0};
++
++    std::thread remover([&] {
++        if (!hook_item_claim_state(&fixture.state, CHAIN_ITEM_STATE_READY,
++                                   CHAIN_ITEM_STATE_REMOVING))
++            failed = 1;
++        claimed.wait();
++        reader_released.wait();
++        hook_item_publish_debt(&fixture.counted, &fixture.debt);
++        if (!hook_item_try_claim_removing_drain(
++                &fixture.state, &fixture.readers) ||
++            !finish_claimed(fixture))
++            failed = 1;
++    });
++    std::thread reader([&] {
++        claimed.wait();
++        __atomic_sub_fetch(&fixture.readers, 1, __ATOMIC_ACQ_REL);
++        if (hook_item_try_claim_drain(&fixture.state, &fixture.readers))
++            failed = 1;
++        reader_released.wait();
++    });
++    remover.join();
++    reader.join();
++    CHECK(!failed.load());
++    return EXIT_SUCCESS;
++}
++
++static int test_reader_after_debt_before_waiting()
++{
++    HookFixture fixture;
++    Barrier debt_published(2);
++    Barrier reader_released(2);
++    std::atomic<int> failed{0};
++
++    std::thread remover([&] {
++        if (!hook_item_claim_state(&fixture.state, CHAIN_ITEM_STATE_READY,
++                                   CHAIN_ITEM_STATE_REMOVING))
++            failed = 1;
++        hook_item_publish_debt(&fixture.counted, &fixture.debt);
++        debt_published.wait();
++        reader_released.wait();
++        if (!hook_item_try_claim_removing_drain(
++                &fixture.state, &fixture.readers) ||
++            !finish_claimed(fixture))
++            failed = 1;
++    });
++    std::thread reader([&] {
++        debt_published.wait();
++        __atomic_sub_fetch(&fixture.readers, 1, __ATOMIC_ACQ_REL);
++        if (hook_item_try_claim_drain(&fixture.state, &fixture.readers))
++            failed = 1;
++        reader_released.wait();
++    });
++    remover.join();
++    reader.join();
++    CHECK(!failed.load());
++    return EXIT_SUCCESS;
++}
++
++static int test_reader_after_waiting_publish()
++{
++    HookFixture fixture;
++    Barrier waiting_published(2);
++    Barrier reader_finished(2);
++    std::atomic<int> failed{0};
++
++    std::thread remover([&] {
++        if (!hook_item_claim_state(&fixture.state, CHAIN_ITEM_STATE_READY,
++                                   CHAIN_ITEM_STATE_REMOVING))
++            failed = 1;
++        hook_item_publish_debt(&fixture.counted, &fixture.debt);
++        hook_item_publish_waiting(&fixture.state);
++        waiting_published.wait();
++        reader_finished.wait();
++        if (fixture.state != CHAIN_ITEM_STATE_EMPTY ||
++            fixture.counted != 0 || fixture.debt != 0)
++            failed = 1;
++    });
++    std::thread reader([&] {
++        waiting_published.wait();
++        __atomic_sub_fetch(&fixture.readers, 1, __ATOMIC_ACQ_REL);
++        if (!hook_item_try_claim_drain(&fixture.state, &fixture.readers) ||
++            !finish_claimed(fixture))
++            failed = 1;
++        reader_finished.wait();
++    });
++    remover.join();
++    reader.join();
++    CHECK(!failed.load());
++    return EXIT_SUCCESS;
++}
++
++static int test_route_operation_does_not_spin()
++{
++    syscall_hook_route route{};
++    syscall_hook_route_claim install_claim{};
++    syscall_hook_route_claim competing_claim{};
++    Barrier claimed(2);
++    Barrier competitor_done(2);
++    std::atomic<int> failed{0};
++
++    std::thread installer([&] {
++        if (syscall_hook_route_begin_install(
++                &route, 0x1000, 0, &install_claim) != 0)
++            failed = 1;
++        claimed.wait();
++        competitor_done.wait();
++        syscall_hook_route_finish_install(&route, &install_claim, 1);
++    });
++    std::thread competitor([&] {
++        claimed.wait();
++        if (syscall_hook_route_begin_remove(
++                &route, &competing_claim) != -2)
++            failed = 1;
++        if (syscall_hook_route_begin_install(
++                &route, 0, 0x2000, &competing_claim) != -2)
++            failed = 1;
++        competitor_done.wait();
++    });
++    installer.join();
++    competitor.join();
++    CHECK(!failed.load());
++    CHECK(route.state == SYSCALL_ROUTE_BOUND);
++    CHECK(route.backend == SYSCALL_HOOK_FUNCTION_POINTER);
++    CHECK(route.target == 0x1000);
++
++    CHECK(syscall_hook_route_begin_remove(&route, &competing_claim) == 0);
++    CHECK(syscall_hook_route_begin_install(
++              &route, 0, 0x3000, &install_claim) == -2);
++    syscall_hook_route_finish_remove(&route);
++    CHECK(syscall_hook_route_begin_install(
++              &route, 0, 0x3000, &install_claim) == 0);
++    CHECK(install_claim.backend == SYSCALL_HOOK_FUNCTION_POINTER);
++    CHECK(install_claim.target == 0x1000 && install_claim.was_bound);
++    syscall_hook_route_finish_install(&route, &install_claim, 1);
++    return EXIT_SUCCESS;
++}
++
++static int test_retiring_owner_window()
++{
++    module_lifecycle lifecycle;
++    module_lifecycle_init(&lifecycle);
++    module_lifecycle_mark_live(&lifecycle);
++    std::mutex lock;
++    Barrier retiring(2);
++    Barrier second_checked(2);
++    std::atomic<int> failed{0};
++
++    std::thread first([&] {
++        module_lifecycle_state previous;
++        bool exit_done;
++        {
++            std::lock_guard<std::mutex> guard(lock);
++            if (!module_lifecycle_begin_unload(
++                    &lifecycle, &previous, &exit_done) || exit_done)
++                failed = 1;
++            module_lifecycle_mark_retiring(&lifecycle);
++        }
++        retiring.wait();
++        second_checked.wait();
++        std::lock_guard<std::mutex> guard(lock);
++        module_lifecycle_mark_exit_done(&lifecycle);
++        lifecycle.exit_error = -38;
++    });
++    std::thread second([&] {
++        module_lifecycle_state previous;
++        bool exit_done;
++        retiring.wait();
++        {
++            std::lock_guard<std::mutex> guard(lock);
++            if (module_lifecycle_begin_unload(
++                    &lifecycle, &previous, &exit_done))
++                failed = 1;
++        }
++        second_checked.wait();
++    });
++    first.join();
++    second.join();
++    CHECK(!failed.load());
++
++    module_lifecycle_state previous;
++    bool exit_done;
++    {
++        std::lock_guard<std::mutex> guard(lock);
++        CHECK(module_lifecycle_begin_unload(
++            &lifecycle, &previous, &exit_done));
++    }
++    CHECK(previous == MODULE_STATE_EXIT_DONE && exit_done);
++    return EXIT_SUCCESS;
++}
++
++int main()
++{
++    if (test_reader_before_debt_publish()) return EXIT_FAILURE;
++    if (test_reader_after_debt_before_waiting()) return EXIT_FAILURE;
++    if (test_reader_after_waiting_publish()) return EXIT_FAILURE;
++    if (test_snapshot_cancel_last_reader(inline_reader_release))
++        return EXIT_FAILURE;
++    if (test_snapshot_cancel_last_reader(fp_reader_release))
++        return EXIT_FAILURE;
++    if (test_route_operation_does_not_spin()) return EXIT_FAILURE;
++    if (test_retiring_owner_window()) return EXIT_FAILURE;
++    std::puts("lifecycle_interleavings_test PASS");
++    return EXIT_SUCCESS;
++}
+diff --git a/tests/test_lifecycle_source_contract.py b/tests/test_lifecycle_source_contract.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf14bcf38c1e5485eb02571f3347e33ec273c25d
+--- /dev/null
++++ b/tests/test_lifecycle_source_contract.py
+@@ -0,0 +1,112 @@
++from __future__ import annotations
++
++import re
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def function_body(source: str, name: str) -> str:
++    match = re.search(
++        rf"(?m)^[ \t]*(?:static[ \t]+)?[^;\n]*\b{name}\s*\([^;]*?\)\s*\{{",
++        source,
++        re.S,
++    )
++    if not match:
++        raise AssertionError(f"function not found: {name}")
++    depth = 0
++    for index in range(match.end() - 1, len(source)):
++        if source[index] == "{":
++            depth += 1
++        elif source[index] == "}":
++            depth -= 1
++            if depth == 0:
++                return source[match.start() : index + 1]
++    raise AssertionError(f"unterminated function: {name}")
++
++
++def main() -> None:
++    rcupdate = (ROOT / "kernel/linux/include/linux/rcupdate.h").read_text()
++    module = (ROOT / "kernel/patch/module/module.c").read_text()
++    syscall = (ROOT / "kernel/patch/common/syscall.c").read_text()
++    hook = (ROOT / "kernel/base/hook.c").read_text()
++    fphook = (ROOT / "kernel/base/fphook.c").read_text()
++    hook_lifecycle = (ROOT / "kernel/include/hook_lifecycle.h").read_text()
++    route = (ROOT / "kernel/patch/include/syscall_route.h").read_text()
++
++    sync_body = function_body(rcupdate, "synchronize_rcu")
++    assert "kfunc_call(synchronize_rcu)" in sync_body
++    assert "rcu_barrier_tasks_rude" not in sync_body
++
++    retire = function_body(module, "module_retire")
++    assert "if (!kfunc(synchronize_rcu))" in retire
++    assert retire.find("list_del_rcu") < retire.find("synchronize_rcu();")
++    assert retire.find("synchronize_rcu();") < retire.find("return 0;")
++    assert "list_for_each_entry_rcu" in function_body(module, "find_module")
++    unload = function_body(module, "unload_module")
++    assert unload.find("module_retire(mod)") < unload.find("module_destroy(mod)")
++    assert "module_lifecycle_is_control_owner" in unload
++    assert unload.find("module_lifecycle_mark_retiring") < unload.find(
++        "module_retire(mod)"
++    )
++    assert "module_lifecycle_mark_exit_done" in unload
++
++    wrap = function_body(syscall, "hook_syscalln")
++    unwrap = function_body(syscall, "unhook_syscalln_checked")
++    compat_wrap = function_body(syscall, "hook_compat_syscalln")
++    compat_unwrap = function_body(syscall, "unhook_compat_syscalln_checked")
++    assert "syscall_wrap_recorded" in wrap
++    assert "syscall_unwrap_recorded" in unwrap
++    assert "sys_call_table" not in unwrap
++    assert "syscall_wrap_recorded" in compat_wrap
++    assert "syscall_unwrap_recorded" in compat_unwrap
++    assert "compat_sys_call_table" not in compat_unwrap
++    assert "syscall_route_guard" not in syscall
++    recorded_wrap = function_body(syscall, "syscall_wrap_recorded")
++    recorded_unwrap = function_body(syscall, "syscall_unwrap_recorded")
++    assert recorded_wrap.find("syscall_hook_route_begin_install") < recorded_wrap.find(
++        "fp_hook_wrap"
++    )
++    assert recorded_wrap.find("hook_wrap") < recorded_wrap.find(
++        "syscall_hook_route_finish_install"
++    )
++    assert recorded_unwrap.find("syscall_hook_route_begin_remove") < recorded_unwrap.find(
++        "fp_hook_unwrap_checked"
++    )
++    assert recorded_unwrap.find("hook_unwrap_remove_checked") < recorded_unwrap.find(
++        "syscall_hook_route_finish_remove"
++    )
++    assert "while" not in function_body(route, "syscall_hook_route_begin_install")
++    assert "while" not in function_body(route, "syscall_hook_route_begin_remove")
++
++    begin_remove = function_body(hook_lifecycle, "hook_item_begin_remove")
++    finish_remove = function_body(hook_lifecycle, "hook_item_finish_remove")
++    assert begin_remove.find("CHAIN_ITEM_STATE_REMOVING") < begin_remove.find(
++        "hook_item_publish_debt"
++    )
++    assert begin_remove.find("hook_item_publish_debt") < begin_remove.find(
++        "hook_item_publish_waiting"
++    )
++    assert finish_remove.find("hook_item_debt_dec") < finish_remove.find(
++        "CHAIN_ITEM_STATE_EMPTY"
++    )
++    inline_snapshot = function_body(hook, "hook_chain_snapshot_items")
++    inline_release = function_body(hook, "hook_chain_release_items")
++    fp_snapshot = function_body(fphook, "fp_chain_snapshot_items")
++    fp_release = function_body(fphook, "fp_chain_release_items")
++    assert inline_snapshot.count("hook_item_reader_release") == 1
++    assert inline_release.count("hook_item_reader_release") == 1
++    assert fp_snapshot.count("hook_item_reader_release") == 1
++    assert fp_release.count("hook_item_reader_release") == 1
++
++    plain = function_body(hook, "unhook_checked")
++    assert "hook_mem_mark_cleanup_debt" in plain
++    assert "return -HOOK_DEFERRED" in plain
++    assert "hook_uninstall" not in plain
++
++    print("lifecycle_source_contract PASS")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_module_lifecycle.c b/tests/test_module_lifecycle.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..89eb237b3b81ba4762c5e45b80e7dd3a4cc9bd06
+--- /dev/null
++++ b/tests/test_module_lifecycle.c
+@@ -0,0 +1,130 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "../kernel/patch/include/module_lifecycle.h"
++
++#define CHECK(condition)                                                        \
++    do {                                                                        \
++        if (!(condition)) {                                                     \
++            fprintf(stderr, "FAIL line=%d expression=%s\n", __LINE__,        \
++                    #condition);                                                \
++            return 1;                                                           \
++        }                                                                       \
++    } while (0)
++
++static int test_info_control_concurrency(void)
++{
++    struct module_lifecycle lifecycle;
++    enum module_lifecycle_state previous;
++    bool exit_done;
++
++    module_lifecycle_init(&lifecycle);
++    module_lifecycle_mark_live(&lifecycle);
++    CHECK(module_lifecycle_try_get_info(&lifecycle));
++    CHECK(module_lifecycle_try_get_control(&lifecycle, 0x1234));
++    CHECK(module_lifecycle_is_control_owner(&lifecycle, 0x1234));
++    CHECK(!module_lifecycle_try_get_control(&lifecycle, 0x5678));
++    CHECK(lifecycle.active_calls == 2);
++
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(previous == MODULE_STATE_LIVE);
++    CHECK(!exit_done);
++    CHECK(!module_lifecycle_try_get_info(&lifecycle));
++    CHECK(!module_lifecycle_try_get_control(&lifecycle, 0x9999));
++    CHECK(!module_lifecycle_is_idle(&lifecycle));
++
++    module_lifecycle_restore(&lifecycle, previous, -16);
++    CHECK(module_lifecycle_put_control(&lifecycle));
++    CHECK(module_lifecycle_put_info(&lifecycle));
++    CHECK(module_lifecycle_is_idle(&lifecycle));
++    return 0;
++}
++
++static int test_init_rollback_failure_and_retry(void)
++{
++    struct module_lifecycle lifecycle;
++    enum module_lifecycle_state previous;
++    bool exit_done;
++
++    module_lifecycle_init(&lifecycle);
++    lifecycle.init_error = -5;
++    module_lifecycle_mark_exit_failed(&lifecycle, -16);
++    CHECK(lifecycle.state == MODULE_STATE_EXIT_FAILED);
++    CHECK(lifecycle.init_error == -5);
++    CHECK(lifecycle.exit_error == -16);
++    CHECK(module_lifecycle_try_get_info(&lifecycle));
++    CHECK(module_lifecycle_put_info(&lifecycle));
++
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(previous == MODULE_STATE_EXIT_FAILED);
++    CHECK(!exit_done);
++    module_lifecycle_mark_exit_done(&lifecycle);
++    CHECK(module_lifecycle_is_idle(&lifecycle));
++
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(previous == MODULE_STATE_EXIT_DONE);
++    CHECK(exit_done);
++    CHECK(module_lifecycle_is_idle(&lifecycle));
++    return 0;
++}
++
++static int test_exit_done_waits_for_prior_info_ref(void)
++{
++    struct module_lifecycle lifecycle;
++    enum module_lifecycle_state previous;
++    bool exit_done;
++
++    module_lifecycle_init(&lifecycle);
++    module_lifecycle_mark_live(&lifecycle);
++    CHECK(module_lifecycle_try_get_info(&lifecycle));
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(!exit_done);
++    module_lifecycle_mark_exit_done(&lifecycle);
++    CHECK(!module_lifecycle_try_get_info(&lifecycle));
++    CHECK(!module_lifecycle_is_idle(&lifecycle));
++    CHECK(module_lifecycle_put_info(&lifecycle));
++    CHECK(module_lifecycle_is_idle(&lifecycle));
++
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(exit_done);
++    CHECK(module_lifecycle_is_idle(&lifecycle));
++    return 0;
++}
++
++static int test_retiring_cannot_be_reclaimed(void)
++{
++    struct module_lifecycle lifecycle;
++    enum module_lifecycle_state previous;
++    bool exit_done;
++
++    module_lifecycle_init(&lifecycle);
++    module_lifecycle_mark_live(&lifecycle);
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(!exit_done);
++    module_lifecycle_mark_retiring(&lifecycle);
++    CHECK(lifecycle.state == MODULE_STATE_RETIRING);
++    CHECK(!module_lifecycle_begin_unload(
++        &lifecycle, &previous, &exit_done));
++
++    module_lifecycle_mark_exit_done(&lifecycle);
++    lifecycle.exit_error = -38;
++    CHECK(module_lifecycle_begin_unload(&lifecycle, &previous, &exit_done));
++    CHECK(previous == MODULE_STATE_EXIT_DONE);
++    CHECK(exit_done);
++    module_lifecycle_mark_retiring(&lifecycle);
++    CHECK(!module_lifecycle_begin_unload(
++        &lifecycle, &previous, &exit_done));
++    return 0;
++}
++
++int main(void)
++{
++    if (test_info_control_concurrency()) return EXIT_FAILURE;
++    if (test_init_rollback_failure_and_retry()) return EXIT_FAILURE;
++    if (test_exit_done_waits_for_prior_info_ref()) return EXIT_FAILURE;
++    if (test_retiring_cannot_be_reclaimed()) return EXIT_FAILURE;
++    puts("module_lifecycle_test PASS");
++    return EXIT_SUCCESS;
++}
+diff --git a/tests/test_syscall_route.c b/tests/test_syscall_route.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..27931e296df1f2d545ba6e978419f14323c674e6
+--- /dev/null
++++ b/tests/test_syscall_route.c
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "../kernel/patch/include/syscall_route.h"
++
++#define CHECK(condition)                                                        \
++    do {                                                                        \
++        if (!(condition)) {                                                     \
++            fprintf(stderr, "FAIL line=%d expression=%s\n", __LINE__,        \
++                    #condition);                                                \
++            return EXIT_FAILURE;                                                \
++        }                                                                       \
++    } while (0)
++
++int main(void)
++{
++    struct syscall_hook_route native = {0};
++    struct syscall_hook_route compat = {0};
++    struct syscall_hook_route_claim claim;
++
++    CHECK(syscall_hook_route_begin_install(
++              &native, 0x1000, 0x2000, &claim) == 0);
++    CHECK(claim.backend == SYSCALL_HOOK_FUNCTION_POINTER &&
++          claim.target == 0x1000 && !claim.was_bound);
++    syscall_hook_route_finish_install(&native, &claim, 1);
++
++    CHECK(syscall_hook_route_begin_install(
++              &native, 0, 0x3000, &claim) == 0);
++    CHECK(claim.backend == SYSCALL_HOOK_FUNCTION_POINTER &&
++          claim.target == 0x1000 && claim.was_bound);
++    syscall_hook_route_finish_install(&native, &claim, 1);
++
++    CHECK(syscall_hook_route_begin_install(
++              &compat, 0, 0x4000, &claim) == 0);
++    CHECK(claim.backend == SYSCALL_HOOK_INLINE &&
++          claim.target == 0x4000 && !claim.was_bound);
++    syscall_hook_route_finish_install(&compat, &claim, 1);
++    CHECK(syscall_hook_route_begin_remove(&compat, &claim) == 0);
++    CHECK(claim.backend == SYSCALL_HOOK_INLINE && claim.target == 0x4000);
++    syscall_hook_route_finish_remove(&compat);
++    CHECK(syscall_hook_route_begin_install(
++              &compat, 0x5000, 0, &claim) == 0);
++    CHECK(claim.backend == SYSCALL_HOOK_INLINE &&
++          claim.target == 0x4000 && claim.was_bound);
++    syscall_hook_route_finish_install(&compat, &claim, 0);
++
++    syscall_hook_route_reset(&native);
++    CHECK(syscall_hook_route_begin_remove(&native, &claim) != 0);
++    CHECK(syscall_hook_route_begin_install(
++              &native, 0, 0x6000, &claim) == 0);
++    syscall_hook_route_finish_install(&native, &claim, 0);
++    CHECK(native.state == SYSCALL_ROUTE_UNBOUND);
++    CHECK(native.backend == SYSCALL_HOOK_NONE && native.target == 0);
++    puts("syscall_route_test PASS");
++    return EXIT_SUCCESS;
++}
+diff --git a/tests/test_transit_pic.py b/tests/test_transit_pic.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..691045929316bed1622216db1b2a4643397313b7
+--- /dev/null
++++ b/tests/test_transit_pic.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python3
++
++import argparse
++import pathlib
++import re
++import subprocess
++import tempfile
++
++
++SECTIONS = (
++    ".transit0.text",
++    ".transit4.text",
++    ".transit8.text",
++    ".transit12.text",
++    ".fp.transit0.text",
++    ".fp.transit4.text",
++    ".fp.transit8.text",
++    ".fp.transit12.text",
++)
++
++
++def run(command: list[str], cwd: pathlib.Path) -> str:
++    result = subprocess.run(command, cwd=cwd, check=True, text=True,
++                            stdout=subprocess.PIPE,
++                            stderr=subprocess.STDOUT)
++    return result.stdout
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--clang", required=True)
++    parser.add_argument("--objdump", required=True)
++    args = parser.parse_args()
++    root = pathlib.Path(__file__).resolve().parents[1]
++    hook_header = (root / "kernel/include/hook.h").read_text(encoding="utf-8")
++    capacity_match = re.search(
++        r"^#define\s+TRANSIT_INST_NUM\s+(0x[0-9a-fA-F]+|[0-9]+)",
++        hook_header,
++        re.MULTILINE,
++    )
++    if not capacity_match:
++        raise SystemExit("TRANSIT_INST_NUM is missing")
++    transit_capacity = int(capacity_match.group(1), 0)
++    includes = [
++        "-Ikernel",
++        "-Ikernel/include",
++        "-Ikernel/patch/include",
++        "-Ikernel/linux",
++        "-Ikernel/linux/include",
++        "-Ikernel/linux/arch/arm64/include",
++        "-Ikernel/linux/tools/arch/arm64/include",
++    ]
++
++    with tempfile.TemporaryDirectory(prefix="kp-transit-pic-") as tmp:
++        tmpdir = pathlib.Path(tmp)
++        objects = []
++        compiler = [args.clang]
++        if "clang" in pathlib.Path(args.clang).name.lower():
++            compiler.append("--target=aarch64-none-elf")
++        for source in ("kernel/base/hook.c", "kernel/base/fphook.c"):
++            output = tmpdir / (pathlib.Path(source).stem + ".o")
++            run([
++                *compiler,
++                "-fno-builtin",
++                "-std=gnu11",
++                "-nostdinc",
++                "-DANDROID",
++                "-O2",
++                *includes,
++                "-c",
++                source,
++                "-o",
++                str(output),
++            ], root)
++            objects.append(output)
++
++        seen = set()
++        sizes = {}
++        for obj in objects:
++            headers = run([args.objdump, "-h", str(obj)], root)
++            for section in SECTIONS:
++                match = re.search(
++                    rf"^\s*\d+\s+{re.escape(section)}\s+([0-9a-fA-F]+)\s",
++                    headers,
++                    re.MULTILINE,
++                )
++                if match:
++                    sizes[section] = int(match.group(1), 16)
++                    seen.add(section)
++
++                    disassembly = run(
++                        [args.objdump, "-d", f"--section={section}", str(obj)],
++                        root,
++                    )
++                    mnemonics = re.findall(
++                        r"^\s*[0-9a-f]+:\s+[0-9a-f]{8}\s+([a-z0-9.]+)",
++                        disassembly,
++                        re.MULTILINE,
++                    )
++                    if "bl" in mnemonics:
++                        raise SystemExit(f"{section}: external/direct BL present")
++                    relocations = run(
++                        [args.objdump, "-r", f"--section={section}", str(obj)],
++                        root,
++                    )
++                    if "R_AARCH64_" in relocations:
++                        raise SystemExit(f"{section}: relocation present")
++                    if "ldaxr" not in mnemonics or "stlxr" not in mnemonics:
++                        raise SystemExit(
++                            f"{section}: reader count is not inline LL/SC"
++                        )
++
++        missing = set(SECTIONS) - seen
++        if missing:
++            raise SystemExit(f"missing transit sections: {sorted(missing)}")
++        oversized = {
++            section: size for section, size in sizes.items()
++            if size // 4 + 2 > transit_capacity
++        }
++        if oversized:
++            raise SystemExit(f"transit buffer overflow: {oversized}")
++
++    print("transit_pic_test PASS", " ".join(
++        f"{section}={sizes[section]}" for section in SECTIONS
++    ))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

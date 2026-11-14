@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <uapi/linux/fs.h>
 #include <hotpatch.h>
+#include <asm/current.h>
 #include <linux/list.h>
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
@@ -22,6 +23,7 @@
 #include <linux/vmalloc.h>
 #include <linux/rcupdate.h>
 #include <linux/rculist.h>
+#include <hook.h>
 
 #include "module.h"
 #include "relo.h"
@@ -395,24 +397,121 @@ static int elf_header_check(struct load_info *info)
 struct module modules = { 0 };
 static spinlock_t module_lock;
 
+static struct module *find_module_locked(const char *name)
+{
+    struct module *pos;
+    list_for_each_entry(pos, &modules.list, list)
+    {
+        if (!strcmp(name, pos->info.name)) return pos;
+    }
+    return 0;
+}
+
+struct module *find_module(const char *name)
+{
+    struct module *mod;
+    if (!name) return 0;
+    list_for_each_entry_rcu(mod, &modules.list, list) {
+        if (!strcmp(name, mod->info.name)) return mod;
+    }
+    return 0;
+}
+
+static struct module *module_get_live(const char *name, long *error)
+{
+    struct module *mod;
+
+    spin_lock(&module_lock);
+    mod = find_module_locked(name);
+    if (!mod) {
+        *error = -ENOENT;
+    } else if (!module_lifecycle_try_get_control(
+                   &mod->lifecycle, (uintptr_t)current)) {
+        *error = -EBUSY;
+        mod = 0;
+    } else {
+        *error = 0;
+    }
+    spin_unlock(&module_lock);
+    return mod;
+}
+
+static void module_put(struct module *mod)
+{
+    spin_lock(&module_lock);
+    if (!module_lifecycle_put_control(&mod->lifecycle)) {
+        spin_unlock(&module_lock);
+        logkfe("module active call underflow: %s\n", mod->info.name);
+        return;
+    }
+    spin_unlock(&module_lock);
+}
+
+static int module_wait_idle(struct module *mod)
+{
+    /* Exit is now outside an RCU read-side section.  Keep the wait bounded:
+     * a module callback that does not return must retain its text and make the
+     * caller retry unload instead of freezing a CPU or freeing live code. */
+    for (unsigned int i = 0; i < 10000000; i++) {
+        unsigned int active;
+        spin_lock(&module_lock);
+        active = mod->lifecycle.active_calls;
+        spin_unlock(&module_lock);
+        if (!active) return 0;
+        asm volatile("yield" ::: "memory");
+    }
+    return -EBUSY;
+}
+
+static void module_destroy(struct module *mod)
+{
+    if (mod->args) kvfree(mod->args);
+    if (mod->ctl_args) kvfree(mod->ctl_args);
+    kp_free_exec(mod->start);
+    kvfree(mod);
+}
+
+static int module_retire(struct module *mod)
+{
+    if (!kfunc(synchronize_rcu)) return -ENOSYS;
+    spin_lock(&module_lock);
+    list_del_rcu(&mod->list);
+    spin_unlock(&module_lock);
+    synchronize_rcu();
+    return 0;
+}
+
+static long module_call_exit(struct module *mod, void *__user reserved)
+{
+    for (unsigned int attempt = 0; attempt < 16; attempt++) {
+        long rc = (*mod->exit)(reserved);
+        if (rc == -(long)HOOK_DEFERRED ||
+            rc == -(long)HOOK_READER_BUSY) {
+            if (hook_cleanup_pending() && hook_cleanup_drain()) return rc;
+            continue;
+        }
+        if (rc) return rc;
+        if (!hook_cleanup_pending()) return 0;
+        if (hook_cleanup_drain()) return -EBUSY;
+    }
+    return -EBUSY;
+}
+
 long load_module(const void *data, int len, const char *args, const char *event, void *__user reserved)
 {
     struct load_info load_info = { .len = len, .hdr = data };
     struct load_info *info = &load_info;
     long rc = 0;
 
+    if (!hook_management_context_ok()) return -EBUSY;
+
     if ((rc = elf_header_check(info))) goto out;
     if ((rc = setup_load_info(info))) goto out;
-
-    if (find_module(info->info.name)) {
-        logkfd("%s exist\n", info->info.name);
-        rc = -EEXIST;
-        goto out;
-    }
 
     struct module *mod = (struct module *)vmalloc(sizeof(struct module));
     if (!mod) return -ENOMEM;
     memset(mod, 0, sizeof(struct module));
+    module_lifecycle_init(&mod->lifecycle);
 
     if (args) {
         mod->args = vmalloc(strlen(args) + 1);
@@ -432,15 +531,77 @@ long load_module(const void *data, int len, const char *args, const char *event,
 
     flush_icache_all();
 
+    /* Reserve the name before init so concurrent loads cannot both publish
+     * the same module.  LOADING entries are visible to list/info but reject
+     * control and unload until init reaches a terminal state. */
+    spin_lock(&module_lock);
+    if (find_module_locked(mod->info.name)) {
+        spin_unlock(&module_lock);
+        logkfd("%s exist\n", mod->info.name);
+        rc = -EEXIST;
+        goto free;
+    }
+    INIT_LIST_HEAD(&mod->list);
+    list_add_tail_rcu(&mod->list, &modules.list);
+    spin_unlock(&module_lock);
+
     rc = (*mod->init)(mod->args, event, reserved);
 
     if (!rc) {
+        spin_lock(&module_lock);
+        module_lifecycle_mark_live(&mod->lifecycle);
+        spin_unlock(&module_lock);
         logkfi("[%s] succeed with [%s] \n", mod->info.name, args);
-        list_add_tail(&mod->list, &modules.list);
         goto out;
     } else {
+        long exit_rc;
+        long idle_rc;
+        spin_lock(&module_lock);
+        mod->lifecycle.init_error = rc;
+        spin_unlock(&module_lock);
         logkfi("[%s] failed with [%s] error: %d, try exit ...\n", mod->info.name, args, rc);
-        (*mod->exit)(reserved);
+        exit_rc = module_call_exit(mod, reserved);
+        if (exit_rc) {
+            spin_lock(&module_lock);
+            module_lifecycle_mark_exit_failed(&mod->lifecycle, exit_rc);
+            spin_unlock(&module_lock);
+            logkfe("[%s] init rollback failed: %ld; module retained for unload retry\n",
+                   mod->info.name, exit_rc);
+            goto out;
+        }
+        if (hook_cleanup_pending()) {
+            spin_lock(&module_lock);
+            module_lifecycle_mark_exit_failed(&mod->lifecycle, -EBUSY);
+            spin_unlock(&module_lock);
+            logkfe("[%s] init rollback left deferred hooks; module retained\n",
+                   mod->info.name);
+            goto out;
+        }
+        spin_lock(&module_lock);
+        module_lifecycle_mark_retiring(&mod->lifecycle);
+        spin_unlock(&module_lock);
+        idle_rc = module_wait_idle(mod);
+        if (idle_rc) {
+            spin_lock(&module_lock);
+            module_lifecycle_mark_exit_done(&mod->lifecycle);
+            mod->lifecycle.exit_error = idle_rc;
+            spin_unlock(&module_lock);
+            logkfe("[%s] init rollback completed but references remain rc=%ld; module retained\n",
+                   mod->info.name, idle_rc);
+            goto out;
+        }
+        idle_rc = module_retire(mod);
+        if (idle_rc) {
+            spin_lock(&module_lock);
+            module_lifecycle_mark_exit_done(&mod->lifecycle);
+            mod->lifecycle.exit_error = idle_rc;
+            spin_unlock(&module_lock);
+            logkfe("[%s] ordinary RCU grace unavailable rc=%ld; module retained\n",
+                   mod->info.name, idle_rc);
+            goto out;
+        }
+        module_destroy(mod);
+        goto out;
     }
 
 free:
@@ -452,33 +613,95 @@ out:
     return rc;
 }
 
-// todo: lock
 long unload_module(const char *name, void *__user reserved)
 {
     if (!name) return -EINVAL;
+    if (!hook_management_context_ok()) return -EBUSY;
     logkfe("name: %s\n", name);
 
-    rcu_read_lock();
     long rc = 0;
+    enum module_lifecycle_state previous_state;
+    bool exit_already_done;
 
-    struct module *mod = find_module(name);
+    spin_lock(&module_lock);
+    struct module *mod = find_module_locked(name);
     if (!mod) {
-        rc = -ENOENT;
-        goto out;
+        spin_unlock(&module_lock);
+        return -ENOENT;
     }
-    list_del(&mod->list);
-    rc = (*mod->exit)(reserved);
 
-    if (mod->args) kvfree(mod->args);
-    if (mod->ctl_args) kvfree(mod->ctl_args);
+    if (module_lifecycle_is_control_owner(
+            &mod->lifecycle, (uintptr_t)current)) {
+        spin_unlock(&module_lock);
+        return -EBUSY;
+    }
 
-    kp_free_exec(mod->start);
-    kvfree(mod);
+    if (!module_lifecycle_begin_unload(&mod->lifecycle, &previous_state,
+                                       &exit_already_done)) {
+        spin_unlock(&module_lock);
+        return -EBUSY;
+    }
+    spin_unlock(&module_lock);
 
-    logkfi("name: %s, rc: %d\n", name, rc);
+    rc = module_wait_idle(mod);
+    if (rc) {
+        spin_lock(&module_lock);
+        module_lifecycle_restore(&mod->lifecycle, previous_state, rc);
+        spin_unlock(&module_lock);
+        logkfe("name: %s has active calls; unload retained rc=%ld\n",
+               name, rc);
+        return rc;
+    }
 
-out:
-    rcu_read_unlock();
+    /* Deliberately outside rcu_read_lock and module_lock: exit may need a
+     * grace period or bounded wait.  The EXITING state prevents new calls. */
+    if (!exit_already_done) {
+        rc = module_call_exit(mod, reserved);
+        if (rc) {
+            spin_lock(&module_lock);
+            module_lifecycle_mark_exit_failed(&mod->lifecycle, rc);
+            spin_unlock(&module_lock);
+            logkfe("name: %s exit failed rc=%ld; module text retained for retry\n",
+                   name, rc);
+            return rc;
+        }
+    }
+
+    if (hook_cleanup_pending()) {
+        spin_lock(&module_lock);
+        module_lifecycle_mark_exit_failed(&mod->lifecycle, -EBUSY);
+        spin_unlock(&module_lock);
+        logkfe("name: %s exit left deferred hooks; module text retained\n",
+               name);
+        return -EBUSY;
+    }
+
+    spin_lock(&module_lock);
+    module_lifecycle_mark_retiring(&mod->lifecycle);
+    spin_unlock(&module_lock);
+    rc = module_wait_idle(mod);
+    if (rc) {
+        spin_lock(&module_lock);
+        module_lifecycle_mark_exit_done(&mod->lifecycle);
+        mod->lifecycle.exit_error = rc;
+        spin_unlock(&module_lock);
+        logkfe("name: %s exit completed but references remain rc=%ld; module retained\n",
+               name, rc);
+        return rc;
+    }
+    rc = module_retire(mod);
+    if (rc) {
+        spin_lock(&module_lock);
+        module_lifecycle_mark_exit_done(&mod->lifecycle);
+        mod->lifecycle.exit_error = rc;
+        spin_unlock(&module_lock);
+        logkfe("name: %s ordinary RCU grace unavailable rc=%ld; module retained\n",
+               name, rc);
+        return rc;
+    }
+    module_destroy(mod);
+
+    logkfi("name: %s, rc: %ld\n", name, rc);
     return rc;
 }
 
@@ -487,6 +710,7 @@ long load_module_path(const char *path, const char *args, void *__user reserved)
     long rc = 0;
     logkfd("%s\n", path);
     if (!path) return -EINVAL;
+    if (!hook_management_context_ok()) return -EBUSY;
 
     struct file *filp = filp_open(path, O_RDONLY, 0);
     if (unlikely(!filp || IS_ERR(filp))) {
@@ -525,24 +749,20 @@ out:
 long module_control0(const char *name, const char *ctl_args, char *__user out_msg, int outlen)
 {
     if (!name || !ctl_args) return -EINVAL;
+    if (!hook_management_context_ok()) return -EBUSY;
     int args_len = strlen(ctl_args);
     if (args_len <= 0) return -EINVAL;
 
     logkfi("name %s, args: %s\n", name, ctl_args);
 
     long rc = 0;
-    rcu_read_lock();
-
-    struct module *mod = find_module(name);
-    if (!mod) {
-        rc = -ENOENT;
-        goto out;
-    }
+    struct module *mod = module_get_live(name, &rc);
+    if (!mod) return rc;
 
     if (!*mod->ctl0) {
         logkfe("no ctl0\n");
         rc = -ENOSYS;
-        goto out;
+        goto put;
     }
 
     if (mod->ctl_args) kvfree(mod->ctl_args);
@@ -550,68 +770,52 @@ long module_control0(const char *name, const char *ctl_args, char *__user out_ms
     mod->ctl_args = vmalloc(args_len + 1);
     if (!mod->ctl_args) {
         rc = -ENOMEM;
-        goto out;
+        goto put;
     }
 
     strcpy(mod->ctl_args, ctl_args);
 
     rc = (*mod->ctl0)(mod->ctl_args, out_msg, outlen);
 
-    logkfi("name: %s, rc: %d\n", name, rc);
-out:
-    rcu_read_unlock();
+    logkfi("name: %s, rc: %ld\n", name, rc);
+put:
+    module_put(mod);
     return rc;
 }
 
 long module_control1(const char *name, void *a1, void *a2, void *a3)
 {
+    if (!name) return -EINVAL;
+    if (!hook_management_context_ok()) return -EBUSY;
     logkfi("name %s, a1: %llx, a2: %llx, a3: %llx\n", name, a1, a2, a3);
     long rc = 0;
-    rcu_read_lock();
-
-    struct module *mod = find_module(name);
-    if (!mod) {
-        rc = -ENOENT;
-        goto out;
-    }
+    struct module *mod = module_get_live(name, &rc);
+    if (!mod) return rc;
 
     if (!*mod->ctl1) {
         logkfe("no ctl1\n");
         rc = -ENOSYS;
-        goto out;
+        goto put;
     }
 
     rc = (*mod->ctl1)(a1, a2, a3);
 
-    logkfi("name: %s, rc: %d\n", name, rc);
-out:
-    rcu_read_unlock();
+    logkfi("name: %s, rc: %ld\n", name, rc);
+put:
+    module_put(mod);
     return rc;
-}
-
-struct module *find_module(const char *name)
-{
-    struct module *pos;
-    list_for_each_entry(pos, &modules.list, list)
-    {
-        if (!strcmp(name, pos->info.name)) {
-            return pos;
-        }
-    }
-    return 0;
 }
 
 int get_module_nums()
 {
-    rcu_read_lock();
-
     struct module *pos;
     int n = 0;
+    spin_lock(&module_lock);
     list_for_each_entry(pos, &modules.list, list)
     {
         n++;
     }
-    rcu_read_unlock();
+    spin_unlock(&module_lock);
 
     logkfd("%d\n", n);
     return n;
@@ -619,27 +823,47 @@ int get_module_nums()
 
 int list_modules(char *out_names, int size)
 {
-    rcu_read_lock();
+    if (!out_names || size <= 0) return -EINVAL;
 
     struct module *pos;
     int off = 0;
+    spin_lock(&module_lock);
     list_for_each_entry(pos, &modules.list, list)
     {
-        off += snprintf(out_names + off, size - 1 - off, "%s\n", pos->info.name);
+        int written;
+        int remaining;
+        if (off >= size - 1) break;
+        remaining = size - off;
+        written = snprintf(out_names + off, remaining, "%s\n",
+                           pos->info.name);
+        if (written < 0) break;
+        if (written >= remaining) {
+            off = size - 1;
+            break;
+        }
+        off += written;
     }
     if (off > 0) out_names[off - 1] = '\0';
-
-    rcu_read_unlock();
+    spin_unlock(&module_lock);
     return off;
 }
 
 int get_module_info(const char *name, char *out_info, int size)
 {
     if (size <= 0) return 0;
-    rcu_read_lock();
+    if (!name || !out_info) return -EINVAL;
 
-    struct module *mod = find_module(name);
-    if (!mod) return -ENOENT;
+    spin_lock(&module_lock);
+    struct module *mod = find_module_locked(name);
+    if (!mod) {
+        spin_unlock(&module_lock);
+        return -ENOENT;
+    }
+    if (!module_lifecycle_try_get_info(&mod->lifecycle)) {
+        spin_unlock(&module_lock);
+        return -EBUSY;
+    }
+    spin_unlock(&module_lock);
 
     int sz = snprintf(out_info, size - 1,
                       "name=%s\n"
@@ -651,10 +875,19 @@ int get_module_info(const char *name, char *out_info, int size)
                       mod->info.name, mod->info.version, mod->info.license, mod->info.author, mod->info.description,
                       mod->args);
 
-    if (sz > 0) out_info[sz - 1] = '\0';
+    if (sz > 0) {
+        int terminator = sz - 1;
+        if (terminator >= size - 1) terminator = size - 2;
+        if (terminator >= 0) out_info[terminator] = '\0';
+    }
     logkfd("%s", out_info);
-
-    rcu_read_unlock();
+    spin_lock(&module_lock);
+    if (!module_lifecycle_put_info(&mod->lifecycle)) {
+        spin_unlock(&module_lock);
+        logkfe("module info reference underflow: %s\n", name);
+        return -EIO;
+    }
+    spin_unlock(&module_lock);
     return sz;
 }
 

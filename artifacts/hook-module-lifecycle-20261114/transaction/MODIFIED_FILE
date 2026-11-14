@@ -1,0 +1,22 @@
+Base: 0d80e994f26b7c25fc03a45753ed2c93be430554
+Modified: d3f621c5f698a79101452dd77e0cccc78c213fb6
+
+M	kernel/base/fphook.c
+M	kernel/base/hmem.c
+M	kernel/base/hmem.h
+M	kernel/base/hook.c
+M	kernel/include/hook.h
+A	kernel/include/hook_lifecycle.h
+M	kernel/linux/include/linux/rcupdate.h
+M	kernel/patch/common/syscall.c
+M	kernel/patch/include/module.h
+A	kernel/patch/include/module_lifecycle.h
+M	kernel/patch/include/syscall.h
+A	kernel/patch/include/syscall_route.h
+M	kernel/patch/module/module.c
+A	tests/test_hook_lifecycle.c
+A	tests/test_lifecycle_interleavings.cpp
+A	tests/test_lifecycle_source_contract.py
+A	tests/test_module_lifecycle.c
+A	tests/test_syscall_route.c
+A	tests/test_transit_pic.py

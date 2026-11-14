@@ -8,6 +8,7 @@
 
 #include <asm-generic/module.h>
 #include <kpmodule.h>
+#include <module_lifecycle.h>
 
 struct load_info
 {
@@ -49,6 +50,11 @@ struct module
     void *start;
 
     struct list_head list;
+
+    /* Protected by module_lock.  A failed init/exit keeps the allocation in
+     * the table so the exact exit routine can be retried without freeing live
+     * module text. */
+    struct module_lifecycle lifecycle;
 };
 
 long load_module(const void *data, int len, const char *args, const char *event, void *__user reserved);
@@ -56,6 +62,9 @@ long load_module_path(const char *path, const char *args, void *__user reserved)
 long module_control0(const char *name, const char *ctl_args, char *__user out_msg, int outlen);
 long module_control1(const char *name, void *a1, void *a2, void *a3);
 long unload_module(const char *name, void *__user reserved);
+/* Legacy non-owning lookup.  The caller must hold rcu_read_lock() until it
+ * stops dereferencing the returned module.  New code should use control/info
+ * APIs, which hold explicit active-call references. */
 struct module *find_module(const char *name);
 
 int get_module_nums();

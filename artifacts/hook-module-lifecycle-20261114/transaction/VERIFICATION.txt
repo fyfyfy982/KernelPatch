@@ -1,0 +1,32 @@
+Scope: KernelPatch hook/module lifecycle and syscall route ownership
+Base: 0d80e994f26b7c25fc03a45753ed2c93be430554
+Modified: d3f621c5f698a79101452dd77e0cccc78c213fb6
+
+SOURCE REVIEW
+PASS - independent gpt-6.1-sol review found no remaining P0-P2
+PASS - ordinary synchronize_rcu wrapper and fail-closed symbol gate reviewed
+PASS - module RETIRING owner covers exit through list removal/grace/free
+PASS - inline/FP reader release covers normal and snapshot-cancel paths
+PASS - syscall route records install-time backend/target and performs grace outside CAS ownership
+
+HOST AND CROSS BUILD
+PASS - hook lifecycle C test, including 33-reader debt drain
+PASS - module lifecycle C test
+PASS - syscall route C test
+PASS - deterministic interleaving C++ test
+PASS - lifecycle source contract and FKpm source contract
+PASS - GCC 14 and Clang 18 AArch64 syntax checks
+PASS - GCC 14 transit PIC: no BL/relocation, LL/SC present, max 940 bytes
+PASS - Clang 18 transit PIC: no BL/relocation, LL/SC present, max 960 bytes
+PASS - FKpm build.py complete compile/link against this source
+
+DEVICE BOUNDARY
+NOT_RUN - GNU 12.2 make kpimg and new kernel build/install
+NOT_RUN - real-device KPM load/unload/reload, 33-hook force-stop, concurrent control/info
+The retained pstore proves stale KPM execution during reload in the old build;
+host/source evidence does not close that device incident.
+
+ROLLBACK REPLAY
+PASS - ROLLBACK.sh executed in an independent clone
+PASS - all 19 changed production/test paths matched base bytes exactly
+PASS - rollback clone and detached base worktree were removed

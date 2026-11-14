@@ -9,6 +9,8 @@
 #include <kpmalloc.h>
 #include <io.h>
 #include <symbol.h>
+#include <asm/current.h>
+#include <asm/thread_info.h>
 #include "hmem.h"
 
 #define bits32(n, high, low) ((uint32_t)((n) << (31u - (high))) >> (31u - (high) + (low)))
@@ -16,6 +18,124 @@
 #define sign64_extend(n, len) \
     (((uint64_t)((n) << (63u - (len - 1))) >> 63u) ? ((n) | (0xFFFFFFFFFFFFFFFF << (len))) : n)
 #define align_ceil(x, align) (((u64)(x) + (u64)(align) - 1) & ~((u64)(align) - 1))
+
+static volatile int32_t hook_chain_guard;
+volatile int32_t hook_deferred_debt;
+
+static void hook_chain_lock(void)
+{
+    while (__atomic_exchange_n(&hook_chain_guard, 1, __ATOMIC_ACQUIRE))
+        asm volatile("yield" ::: "memory");
+}
+
+static void hook_chain_unlock(void)
+{
+    __atomic_store_n(&hook_chain_guard, 0, __ATOMIC_RELEASE);
+}
+
+static int hook_chain_grace_period(void)
+{
+    typedef void (*sync_rcu_tasks_t)(void);
+    sync_rcu_tasks_t sync_rcu_tasks = (sync_rcu_tasks_t)
+        symbol_lookup_name("synchronize_rcu_tasks");
+    if (!sync_rcu_tasks) {
+        logke("hook chain grace unavailable: synchronize_rcu_tasks missing\n");
+        return -HOOK_GRACE_UNAVAILABLE;
+    }
+    sync_rcu_tasks();
+    return HOOK_NO_ERR;
+}
+
+int hook_reactivation_grace(void)
+{
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+    return hook_chain_grace_period();
+}
+KP_EXPORT_SYMBOL(hook_reactivation_grace);
+
+int hook_management_context_ok(void)
+{
+    uint64_t daif;
+    struct thread_info *info = current_thread_info();
+
+    asm volatile("mrs %0, daif" : "=r"(daif));
+    if (!info || (daif & (3u << 6)) != 0) return 0;
+    return info->preempt.count == 0;
+}
+KP_EXPORT_SYMBOL(hook_management_context_ok);
+
+int hook_cleanup_pending(void)
+{
+    return __atomic_load_n(&hook_deferred_debt, __ATOMIC_ACQUIRE);
+}
+KP_EXPORT_SYMBOL(hook_cleanup_pending);
+
+hook_err_t hook_cleanup_drain(void)
+{
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+    for (unsigned int i = 0; i < 10000000; i++) {
+        if (!hook_cleanup_pending()) return HOOK_NO_ERR;
+        asm volatile("yield" ::: "memory");
+    }
+    return -HOOK_DEFERRED;
+}
+KP_EXPORT_SYMBOL(hook_cleanup_drain);
+
+static inline __attribute__((always_inline)) int32_t
+transit_reader_inc(volatile int32_t *reader)
+{
+    int32_t value;
+    uint32_t status;
+    asm volatile(
+        "1: ldaxr %w[value], [%[reader]]\n"
+        "add %w[value], %w[value], #1\n"
+        "stlxr %w[status], %w[value], [%[reader]]\n"
+        "cbnz %w[status], 1b\n"
+        : [value] "=&r"(value), [status] "=&r"(status)
+        : [reader] "r"(reader)
+        : "memory");
+    return value;
+}
+
+static inline __attribute__((always_inline)) int
+hook_chain_snapshot_items(hook_chain_t *chain,
+                          uint8_t retained[HOOK_CHAIN_NUM])
+{
+    int max = __atomic_load_n(&chain->chain_items_max, __ATOMIC_ACQUIRE);
+    if (max < 0) max = 0;
+    if (max > HOOK_CHAIN_NUM) max = HOOK_CHAIN_NUM;
+
+    for (int i = 0; i < HOOK_CHAIN_NUM; i++) retained[i] = 0;
+    for (int i = 0; i < max; i++) {
+        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
+            CHAIN_ITEM_STATE_READY)
+            continue;
+        transit_reader_inc(&chain->readers[i]);
+        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) ==
+            CHAIN_ITEM_STATE_READY) {
+            retained[i] = 1;
+        } else {
+            hook_item_reader_release(
+                &chain->states[i], &chain->readers[i],
+                &chain->debt_counted[i], chain->debt_ptr,
+                &chain->udata[i], &chain->befores[i], &chain->afters[i]);
+        }
+    }
+    return max;
+}
+
+static inline __attribute__((always_inline)) void
+hook_chain_release_items(hook_chain_t *chain,
+                         const uint8_t retained[HOOK_CHAIN_NUM], int max)
+{
+    for (int i = 0; i < max; i++) {
+        if (!retained[i]) continue;
+        hook_item_reader_release(
+            &chain->states[i], &chain->readers[i],
+            &chain->debt_counted[i], chain->debt_ptr,
+            &chain->udata[i], &chain->befores[i], &chain->afters[i]);
+    }
+}
 
 typedef uint32_t inst_type_t;
 typedef uint32_t inst_mask_t;
@@ -351,11 +471,13 @@ uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)
     };
     vptr--;
     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
+    uint8_t retained[HOOK_CHAIN_NUM];
+    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
     hook_fargs0_t fargs;
     fargs.skip_origin = 0;
     fargs.chain = hook_chain;
-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = 0; i < retained_max; i++) {
+        if (!retained[i]) continue;
         hook_chain0_callback func = hook_chain->befores[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
@@ -363,11 +485,12 @@ uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)
         transit0_func_t origin_func = (transit0_func_t)hook_chain->hook.relo_addr;
         fargs.ret = origin_func();
     }
-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = retained_max - 1; i >= 0; i--) {
+        if (!retained[i]) continue;
         hook_chain0_callback func = hook_chain->afters[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
+    hook_chain_release_items(hook_chain, retained, retained_max);
     return fargs.ret;
 }
 extern void _transit0_end();
@@ -385,6 +508,8 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
     };
     vptr--;
     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
+    uint8_t retained[HOOK_CHAIN_NUM];
+    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
     hook_fargs4_t fargs;
     fargs.skip_origin = 0;
     fargs.arg0 = arg0;
@@ -392,8 +517,8 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
     fargs.arg2 = arg2;
     fargs.arg3 = arg3;
     fargs.chain = hook_chain;
-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = 0; i < retained_max; i++) {
+        if (!retained[i]) continue;
         hook_chain4_callback func = hook_chain->befores[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
@@ -401,11 +526,12 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
         transit4_func_t origin_func = (transit4_func_t)hook_chain->hook.relo_addr;
         fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3);
     }
-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = retained_max - 1; i >= 0; i--) {
+        if (!retained[i]) continue;
         hook_chain4_callback func = hook_chain->afters[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
+    hook_chain_release_items(hook_chain, retained, retained_max);
     return fargs.ret;
 }
 
@@ -425,6 +551,8 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
     };
     vptr--;
     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
+    uint8_t retained[HOOK_CHAIN_NUM];
+    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
     hook_fargs8_t fargs;
     fargs.skip_origin = 0;
     fargs.arg0 = arg0;
@@ -436,8 +564,8 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
     fargs.arg6 = arg6;
     fargs.arg7 = arg7;
     fargs.chain = hook_chain;
-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = 0; i < retained_max; i++) {
+        if (!retained[i]) continue;
         hook_chain8_callback func = hook_chain->befores[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
@@ -446,11 +574,12 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
         fargs.ret =
             origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6, fargs.arg7);
     }
-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = retained_max - 1; i >= 0; i--) {
+        if (!retained[i]) continue;
         hook_chain8_callback func = hook_chain->afters[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
+    hook_chain_release_items(hook_chain, retained, retained_max);
     return fargs.ret;
 }
 
@@ -471,6 +600,8 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t 
     };
     vptr--;
     hook_chain_t *hook_chain = local_container_of((uint64_t)vptr, hook_chain_t, transit);
+    uint8_t retained[HOOK_CHAIN_NUM];
+    int retained_max = hook_chain_snapshot_items(hook_chain, retained);
     hook_fargs12_t fargs;
     fargs.skip_origin = 0;
     fargs.arg0 = arg0;
@@ -486,8 +617,8 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t 
     fargs.arg10 = arg10;
     fargs.arg11 = arg11;
     fargs.chain = hook_chain;
-    for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = 0; i < retained_max; i++) {
+        if (!retained[i]) continue;
         hook_chain12_callback func = hook_chain->befores[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
@@ -496,11 +627,12 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t 
         fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6,
                                 fargs.arg7, fargs.arg8, fargs.arg9, fargs.arg10, fargs.arg11);
     }
-    for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
-        if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
+    for (int32_t i = retained_max - 1; i >= 0; i--) {
+        if (!retained[i]) continue;
         hook_chain12_callback func = hook_chain->afters[i];
         if (func) func(&fargs, hook_chain->udata[i]);
     }
+    hook_chain_release_items(hook_chain, retained, retained_max);
     return fargs.ret;
 }
 
@@ -603,6 +735,10 @@ KP_EXPORT_SYMBOL(hook_prepare);
 // todo:
 void hook_install(hook_t *hook)
 {
+    if (!hook_management_context_ok()) {
+        logke("Hook install rejected outside process context\n");
+        return;
+    }
     uint64_t va = hook->origin_addr;
     uint64_t *entry = pgtable_entry_kernel(va);
     uint64_t ori_prot = *entry;
@@ -619,6 +755,10 @@ KP_EXPORT_SYMBOL(hook_install);
 
 void hook_uninstall(hook_t *hook)
 {
+    if (!hook_management_context_ok()) {
+        logke("Hook uninstall rejected outside process context\n");
+        return;
+    }
     uint64_t va = hook->origin_addr;
     uint64_t *entry = pgtable_entry_kernel(va);
     uint64_t ori_prot = *entry;
@@ -635,6 +775,7 @@ KP_EXPORT_SYMBOL(hook_uninstall);
 hook_err_t hook(void *func, void *replace, void **backup)
 {
     hook_err_t err = HOOK_NO_ERR;
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
     if (!func || !replace || !backup) {
         return -HOOK_BAD_ADDRESS;
     }
@@ -660,14 +801,29 @@ out:
 }
 KP_EXPORT_SYMBOL(hook);
 
-void unhook(void *func)
+hook_err_t unhook_checked(void *func)
 {
+    enum hook_type type;
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+    if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
     uint64_t origin = branch_func_addr((uint64_t)func);
     hook_t *hook = hook_get_mem_from_origin(origin);
-    if (!hook) return;
-    hook_uninstall(hook);
-    hook_mem_free(hook);
-    logkv("Unhook func: %llx\n", func);
+    if (!hook) return -HOOK_NOT_FOUND;
+    type = hook_get_mem_type(hook);
+    if (type != INLINE) {
+        logke("Generic unhook refused type=%d func=%llx\n", type, func);
+        return -HOOK_WRONG_TYPE;
+    }
+    hook_mem_mark_cleanup_debt(hook);
+    logke("Plain INLINE unhook is unload-unsafe; use hook_wrap for removable hooks\n");
+    return -HOOK_DEFERRED;
+}
+KP_EXPORT_SYMBOL(unhook_checked);
+
+void unhook(void *func)
+{
+    hook_err_t rc = unhook_checked(func);
+    if (rc) logke("Unhook failed func=%llx rc=%d\n", func, rc);
 }
 KP_EXPORT_SYMBOL(unhook);
 
@@ -701,7 +857,7 @@ static hook_err_t hook_chain_prepare(uint32_t *transit, int32_t argno)
 
     int32_t transit_num = (transit_end - transit_start) / 4;
     // todo:assert
-    if (transit_num >= TRANSIT_INST_NUM) return -HOOK_TRANSIT_NO_MEM;
+    if (transit_num > TRANSIT_INST_NUM - 2) return -HOOK_TRANSIT_NO_MEM;
 
     transit[0] = ARM64_BTI_JC;
     transit[1] = ARM64_NOP;
@@ -711,23 +867,27 @@ static hook_err_t hook_chain_prepare(uint32_t *transit, int32_t argno)
     return HOOK_NO_ERR;
 }
 
-hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after, void *udata)
+static hook_err_t hook_chain_add_locked(hook_chain_t *chain, void *before,
+                                        void *after, void *udata)
 {
     for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
-        if ((before && chain->befores[i] == before) || (after && chain->afters[i] == after)) return -HOOK_DUPLICATED;
+        if ((before && chain->befores[i] == before) ||
+            (after && chain->afters[i] == after))
+            return -HOOK_DUPLICATED;
 
-        // todo: atomic or lock
-        if (chain->states[i] == CHAIN_ITEM_STATE_EMPTY) {
-            chain->states[i] = CHAIN_ITEM_STATE_BUSY;
-            dsb(ish);
+        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) ==
+            CHAIN_ITEM_STATE_EMPTY) {
+            __atomic_store_n(&chain->states[i], CHAIN_ITEM_STATE_BUSY,
+                             __ATOMIC_RELEASE);
             chain->udata[i] = udata;
             chain->befores[i] = before;
             chain->afters[i] = after;
             if (i + 1 > chain->chain_items_max) {
-                chain->chain_items_max = i + 1;
+                __atomic_store_n(&chain->chain_items_max, i + 1,
+                                 __ATOMIC_RELEASE);
             }
-            dsb(ish);
-            chain->states[i] = CHAIN_ITEM_STATE_READY;
+            __atomic_store_n(&chain->states[i], CHAIN_ITEM_STATE_READY,
+                             __ATOMIC_RELEASE);
             logkv("Wrap chain add: %llx, %llx, %llx successed\n", chain->hook.func_addr, before, after);
             return HOOK_NO_ERR;
         }
@@ -735,39 +895,149 @@ hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after, void *
     logkv("Wrap chain add: %llx, %llx, %llx failed\n", chain->hook.func_addr, before, after);
     return -HOOK_CHAIN_FULL;
 }
+
+hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after,
+                          void *udata)
+{
+    hook_err_t rc;
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+    if (!chain) return -HOOK_BAD_ADDRESS;
+    hook_chain_lock();
+    rc = hook_chain_add_locked(chain, before, after, udata);
+    hook_chain_unlock();
+    return rc;
+}
 KP_EXPORT_SYMBOL(hook_chain_add);
+
+static int hook_chain_find_item(hook_chain_t *chain, void *before,
+                                void *after)
+{
+    for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
+        int state = __atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE);
+        if ((state == CHAIN_ITEM_STATE_READY ||
+             state == CHAIN_ITEM_STATE_BUSY ||
+             state == CHAIN_ITEM_STATE_REMOVING ||
+             state == CHAIN_ITEM_STATE_DRAINING) &&
+            ((before && chain->befores[i] == before) ||
+             (after && chain->afters[i] == after)))
+            return i;
+    }
+    return -1;
+}
+
+hook_err_t hook_chain_remove_checked(hook_chain_t *chain, void *before,
+                                     void *after)
+{
+    int item;
+    enum hook_remove_state remove_state;
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+    if (!chain) return -HOOK_BAD_ADDRESS;
+
+    hook_chain_lock();
+    item = hook_chain_find_item(chain, before, after);
+    if (item < 0) {
+        hook_chain_unlock();
+        return -HOOK_NOT_FOUND;
+    }
+    remove_state = hook_item_begin_remove(
+        &chain->states[item], &chain->debt_counted[item],
+        &chain->readers[item], chain->debt_ptr);
+    if (remove_state == HOOK_REMOVE_FINISHED) {
+        hook_chain_unlock();
+        return HOOK_NO_ERR;
+    }
+    if (remove_state == HOOK_REMOVE_DEFERRED) {
+        hook_chain_unlock();
+        return -HOOK_DEFERRED;
+    }
+    if (remove_state != HOOK_REMOVE_READY) {
+        hook_chain_unlock();
+        return __atomic_load_n(&chain->states[item], __ATOMIC_ACQUIRE) ==
+            CHAIN_ITEM_STATE_DRAINING ? -HOOK_DEFERRED : -HOOK_NOT_FOUND;
+    }
+    chain->udata[item] = 0;
+    chain->befores[item] = 0;
+    chain->afters[item] = 0;
+    hook_item_finish_remove(&chain->states[item],
+                            &chain->debt_counted[item],
+                            chain->debt_ptr);
+    hook_chain_unlock();
+    logkv("Wrap chain remove: %llx, %llx, %llx\n",
+          chain->hook.func_addr, before, after);
+    return HOOK_NO_ERR;
+}
+KP_EXPORT_SYMBOL(hook_chain_remove_checked);
 
 void hook_chain_remove(hook_chain_t *chain, void *before, void *after)
 {
-    for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
-        if (chain->states[i] == CHAIN_ITEM_STATE_READY)
-            if ((before && chain->befores[i] == before) || (after && chain->afters[i] == after)) {
-                chain->states[i] = CHAIN_ITEM_STATE_BUSY;
-                dsb(ish);
-                chain->udata[i] = 0;
-                chain->befores[i] = 0;
-                chain->afters[i] = 0;
-                dsb(ish);
-                chain->states[i] = CHAIN_ITEM_STATE_EMPTY;
-                break;
-            }
-    }
-    logkv("Wrap chain remove: %llx, %llx, %llx\n", chain->hook.func_addr, before, after);
+    hook_err_t rc = hook_chain_remove_checked(chain, before, after);
+    if (rc)
+        logke("Wrap chain removal deferred/failed rc=%d debt=%d\n",
+              rc, hook_cleanup_pending());
 }
 KP_EXPORT_SYMBOL(hook_chain_remove);
 
-// todo: lock
 hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void *udata)
 {
+    hook_err_t err;
+    int needs_install = 0;
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
     if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
     uint64_t faddr = (uint64_t)func;
     uint64_t origin = branch_func_addr(faddr);
     if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
+
+retry:
+    hook_chain_lock();
     hook_chain_t *chain = (hook_chain_t *)hook_get_mem_from_origin(origin);
-    if (chain) return hook_chain_add(chain, before, after, udata);
+    if (chain) {
+        int install_state = __atomic_load_n(&chain->installed,
+                                            __ATOMIC_ACQUIRE);
+        if (install_state == CHAIN_INSTALL_UPDATING) {
+            hook_chain_unlock();
+            return -HOOK_READER_BUSY;
+        }
+        if (install_state == CHAIN_INSTALL_RETIRED &&
+            !__atomic_load_n(&chain->grace_complete, __ATOMIC_ACQUIRE)) {
+            hook_chain_unlock();
+            err = hook_reactivation_grace();
+            if (err) return err;
+            hook_chain_lock();
+            chain = (hook_chain_t *)hook_get_mem_from_origin(origin);
+            if (!chain) {
+                hook_chain_unlock();
+                return -HOOK_NOT_FOUND;
+            }
+            if (__atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE) ==
+                CHAIN_INSTALL_RETIRED)
+                __atomic_store_n(&chain->grace_complete, 1,
+                                 __ATOMIC_RELEASE);
+            hook_chain_unlock();
+            goto retry;
+        }
+        err = hook_chain_add_locked(chain, before, after, udata);
+        if (!err && install_state == CHAIN_INSTALL_RETIRED) {
+            __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
+                             __ATOMIC_RELEASE);
+            needs_install = 1;
+        }
+        hook_chain_unlock();
+        if (!err && needs_install) {
+            hook_chain_install(chain);
+            hook_chain_lock();
+            __atomic_store_n(&chain->installed, CHAIN_INSTALL_ACTIVE,
+                             __ATOMIC_RELEASE);
+            hook_chain_unlock();
+        }
+        return err;
+    }
     chain = (hook_chain_t *)hook_mem_zalloc(origin, INLINE_CHAIN);
-    if (!chain) return -HOOK_NO_MEM;
+    if (!chain) {
+        hook_chain_unlock();
+        return -HOOK_NO_MEM;
+    }
     chain->chain_items_max = 0;
+    chain->debt_ptr = &hook_deferred_debt;
     hook_t *hook = &chain->hook;
     hook->func_addr = faddr;
     hook->origin_addr = origin;
@@ -775,39 +1045,107 @@ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void 
     hook->relo_addr = (uint64_t)hook->relo_insts;
     logkv("Wrap func: %llx, origin: %llx, replace: %llx, relocate: %llx, chain: %llx\n", hook->func_addr,
           hook->origin_addr, hook->replace_addr, hook->relo_addr, chain);
-    hook_err_t err = hook_prepare(hook);
+    err = hook_prepare(hook);
     if (err) goto err;
     err = hook_chain_prepare(chain->transit, argno);
     if (err) goto err;
-    err = hook_chain_add(chain, before, after, udata);
+    err = hook_chain_add_locked(chain, before, after, udata);
     if (err) goto err;
+    __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
+                     __ATOMIC_RELEASE);
+    hook_chain_unlock();
     hook_chain_install(chain);
+    hook_chain_lock();
+    __atomic_store_n(&chain->installed, CHAIN_INSTALL_ACTIVE,
+                     __ATOMIC_RELEASE);
+    hook_chain_unlock();
     logkv("Wrap func: %llx succsseed\n", hook->func_addr);
     return HOOK_NO_ERR;
 err:
     hook_mem_free(chain);
+    hook_chain_unlock();
     logkv("Wrap func: %llx failed, err: %d\n", hook->func_addr, err);
     return err;
 }
 KP_EXPORT_SYMBOL(hook_wrap);
 
-void hook_unwrap_remove(void *func, void *before, void *after, int remove)
+hook_err_t hook_unwrap_remove_checked(void *func, void *before, void *after,
+                                      int remove)
 {
-    if (is_bad_address(func)) return;
+    hook_err_t rc;
+    int empty = 1;
+    int needs_uninstall = 0;
+    int install_state;
+    if (!hook_management_context_ok()) return -HOOK_BAD_CONTEXT;
+    if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
     uint64_t faddr = (uint64_t)func;
     uint64_t origin = branch_func_addr(faddr);
-    if (is_bad_address(func)) return;
+    if (is_bad_address(func)) return -HOOK_BAD_ADDRESS;
+    hook_chain_lock();
     hook_chain_t *chain = (hook_chain_t *)hook_get_mem_from_origin(origin);
-    if (!chain) return;
-    hook_chain_remove(chain, before, after);
-    if (!remove) return;
-    // todo:
-    for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
-        if (chain->states[i] != CHAIN_ITEM_STATE_EMPTY) return;
+    if (!chain || hook_get_mem_type(chain) != INLINE_CHAIN) {
+        hook_chain_unlock();
+        return chain ? -HOOK_WRONG_TYPE : -HOOK_NOT_FOUND;
     }
-    hook_chain_uninstall(chain);
-    // todo: unsafe
-    hook_mem_free(chain);
+    install_state = __atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE);
+    if (install_state == CHAIN_INSTALL_UPDATING) {
+        hook_chain_unlock();
+        return -HOOK_READER_BUSY;
+    }
+    if (install_state == CHAIN_INSTALL_RETIRED) {
+        hook_chain_unlock();
+        /* Last-item removal is idempotent so a module exit can be retried
+         * after a later teardown step failed.  The chain allocation is never
+         * freed; grace is required only before a future reactivation. */
+        return HOOK_NO_ERR;
+    }
+    hook_chain_unlock();
+
+    rc = hook_chain_remove_checked(chain, before, after);
+    if (rc && rc != -HOOK_NOT_FOUND) return rc;
+    if (!remove) return HOOK_NO_ERR;
+
+    hook_chain_lock();
+    for (int i = 0; i < HOOK_CHAIN_NUM; i++) {
+        if (__atomic_load_n(&chain->states[i], __ATOMIC_ACQUIRE) !=
+            CHAIN_ITEM_STATE_EMPTY) {
+            empty = 0;
+            break;
+        }
+    }
+    if (!empty) {
+        hook_chain_unlock();
+        return HOOK_NO_ERR;
+    }
+    if (__atomic_load_n(&chain->installed, __ATOMIC_ACQUIRE) ==
+        CHAIN_INSTALL_ACTIVE) {
+        __atomic_store_n(&chain->installed, CHAIN_INSTALL_UPDATING,
+                         __ATOMIC_RELEASE);
+        needs_uninstall = 1;
+    }
+    hook_chain_unlock();
+
+    if (needs_uninstall) {
+        hook_chain_uninstall(chain);
+        hook_chain_lock();
+        __atomic_store_n(&chain->installed, CHAIN_INSTALL_RETIRED,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&chain->grace_complete, 0, __ATOMIC_RELEASE);
+        hook_chain_unlock();
+    }
+
+    /* Keep the prepared chain allocation for safe reuse.  Immediate free is
+     * unsafe for a CPU that already branched into transit before uninstall. */
     logkv("Unwrap func: %llx\n", func);
+    return HOOK_NO_ERR;
+}
+KP_EXPORT_SYMBOL(hook_unwrap_remove_checked);
+
+void hook_unwrap_remove(void *func, void *before, void *after, int remove)
+{
+    hook_err_t rc = hook_unwrap_remove_checked(func, before, after, remove);
+    if (rc)
+        logke("Unwrap deferred/failed rc=%d debt=%d\n", rc,
+              hook_cleanup_pending());
 }
 KP_EXPORT_SYMBOL(hook_unwrap_remove);

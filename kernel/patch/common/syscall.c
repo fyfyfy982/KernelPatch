@@ -20,6 +20,72 @@
 #include <kputils.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <syscall_route.h>
+
+#define SYSCALL_ROUTE_COUNT 460
+
+static struct syscall_hook_route syscall_routes[SYSCALL_ROUTE_COUNT];
+static struct syscall_hook_route compat_syscall_routes[SYSCALL_ROUTE_COUNT];
+
+static struct syscall_hook_route *syscall_route_slot(int nr, int is_compat)
+{
+    if (nr < 0 || nr >= SYSCALL_ROUTE_COUNT) return 0;
+    return is_compat ? &compat_syscall_routes[nr] : &syscall_routes[nr];
+}
+
+static hook_err_t syscall_wrap_recorded(int nr, int narg, int is_compat,
+                                        void *before, void *after,
+                                        void *udata)
+{
+    struct syscall_hook_route *route = syscall_route_slot(nr, is_compat);
+    struct syscall_hook_route_claim claim;
+    uintptr_t fp_target = 0;
+    uintptr_t inline_target = 0;
+    int claim_rc;
+    hook_err_t rc;
+
+    if (!route) return -HOOK_BAD_ADDRESS;
+    if (__atomic_load_n(&route->state, __ATOMIC_ACQUIRE) ==
+        SYSCALL_ROUTE_UNBOUND) {
+        uintptr_t *table = is_compat ? compat_sys_call_table : sys_call_table;
+        if (table)
+            fp_target = (uintptr_t)(table + nr);
+        else
+            inline_target = syscalln_name_addr(nr, is_compat);
+    }
+    claim_rc = syscall_hook_route_begin_install(
+        route, fp_target, inline_target, &claim);
+    if (claim_rc) return claim_rc == -2 ? -HOOK_READER_BUSY
+                                       : -HOOK_BAD_ADDRESS;
+    if (has_syscall_wrapper) narg = 1;
+    if (claim.backend == SYSCALL_HOOK_FUNCTION_POINTER)
+        rc = fp_hook_wrap(claim.target, narg, before, after, udata);
+    else
+        rc = hook_wrap((void *)claim.target, narg, before, after, udata);
+    syscall_hook_route_finish_install(route, &claim, rc == HOOK_NO_ERR);
+    return rc;
+}
+
+static hook_err_t syscall_unwrap_recorded(int nr, int is_compat,
+                                          void *before, void *after)
+{
+    struct syscall_hook_route *route = syscall_route_slot(nr, is_compat);
+    struct syscall_hook_route_claim claim;
+    int claim_rc;
+    hook_err_t rc;
+
+    if (!route) return -HOOK_BAD_ADDRESS;
+    claim_rc = syscall_hook_route_begin_remove(route, &claim);
+    if (claim_rc) return claim_rc == -2 ? -HOOK_READER_BUSY
+                                       : -HOOK_NOT_FOUND;
+    if (claim.backend == SYSCALL_HOOK_FUNCTION_POINTER)
+        rc = fp_hook_unwrap_checked(claim.target, before, after);
+    else
+        rc = hook_unwrap_remove_checked(
+            (void *)claim.target, before, after, 1);
+    syscall_hook_route_finish_remove(route);
+    return rc;
+}
 
 uintptr_t *sys_call_table = 0;
 KP_EXPORT_SYMBOL(sys_call_table);
@@ -281,17 +347,25 @@ hook_err_t fp_wrap_syscalln(int nr, int narg, int is_compat, void *before, void 
 }
 KP_EXPORT_SYMBOL(fp_wrap_syscalln);
 
-void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
+hook_err_t fp_unwrap_syscalln_checked(int nr, int is_compat, void *before,
+                                      void *after)
 {
     if (!is_compat) {
-        if (!sys_call_table) return;
+        if (!sys_call_table) return -HOOK_BAD_ADDRESS;
         uintptr_t fp_addr = (uintptr_t)(sys_call_table + nr);
-        fp_hook_unwrap(fp_addr, before, after);
+        return fp_hook_unwrap_checked(fp_addr, before, after);
     } else {
-        if (!compat_sys_call_table) return;
+        if (!compat_sys_call_table) return -HOOK_BAD_ADDRESS;
         uintptr_t fp_addr = (uintptr_t)(compat_sys_call_table + nr);
-        fp_hook_unwrap(fp_addr, before, after);
+        return fp_hook_unwrap_checked(fp_addr, before, after);
     }
+}
+KP_EXPORT_SYMBOL(fp_unwrap_syscalln_checked);
+
+void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
+{
+    hook_err_t rc = fp_unwrap_syscalln_checked(nr, is_compat, before, after);
+    if (rc) logke("fp syscall unwrap deferred/failed rc=%d\n", rc);
 }
 KP_EXPORT_SYMBOL(fp_unwrap_syscalln);
 
@@ -310,43 +384,68 @@ hook_err_t inline_wrap_syscalln(int nr, int narg, int is_compat, void *before, v
 }
 KP_EXPORT_SYMBOL(inline_wrap_syscalln);
 
-void inline_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
+hook_err_t inline_unwrap_syscalln_checked(int nr, int is_compat, void *before,
+                                          void *after)
 {
     uintptr_t addr = syscalln_name_addr(nr, is_compat);
-    hook_unwrap((void *)addr, before, after);
+    if (!addr) return -HOOK_BAD_ADDRESS;
+    return hook_unwrap_remove_checked((void *)addr, before, after, 1);
+}
+KP_EXPORT_SYMBOL(inline_unwrap_syscalln_checked);
+
+void inline_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
+{
+    hook_err_t rc = inline_unwrap_syscalln_checked(
+        nr, is_compat, before, after);
+    if (rc) logke("inline syscall unwrap deferred/failed rc=%d\n", rc);
 }
 KP_EXPORT_SYMBOL(inline_unwrap_syscalln);
 
 hook_err_t hook_syscalln(int nr, int narg, void *before, void *after, void *udata)
 {
-    if (sys_call_table) return fp_wrap_syscalln(nr, narg, 0, before, after, udata);
-    return inline_wrap_syscalln(nr, narg, 0, before, after, udata);
+    return syscall_wrap_recorded(nr, narg, 0, before, after, udata);
 }
 KP_EXPORT_SYMBOL(hook_syscalln);
 
+hook_err_t unhook_syscalln_checked(int nr, void *before, void *after)
+{
+    return syscall_unwrap_recorded(nr, 0, before, after);
+}
+KP_EXPORT_SYMBOL(unhook_syscalln_checked);
+
 void unhook_syscalln(int nr, void *before, void *after)
 {
-    if (sys_call_table) return fp_unwrap_syscalln(nr, 0, before, after);
-    return inline_unwrap_syscalln(nr, 0, before, after);
+    hook_err_t rc = unhook_syscalln_checked(nr, before, after);
+    if (rc) logke("syscall unhook deferred/failed rc=%d\n", rc);
 }
 KP_EXPORT_SYMBOL(unhook_syscalln);
 
 hook_err_t hook_compat_syscalln(int nr, int narg, void *before, void *after, void *udata)
 {
-    if (compat_sys_call_table) return fp_wrap_syscalln(nr, narg, 1, before, after, udata);
-    return inline_wrap_syscalln(nr, narg, 1, before, after, udata);
+    return syscall_wrap_recorded(nr, narg, 1, before, after, udata);
 }
 KP_EXPORT_SYMBOL(hook_compat_syscalln);
 
+hook_err_t unhook_compat_syscalln_checked(int nr, void *before, void *after)
+{
+    return syscall_unwrap_recorded(nr, 1, before, after);
+}
+KP_EXPORT_SYMBOL(unhook_compat_syscalln_checked);
+
 void unhook_compat_syscalln(int nr, void *before, void *after)
 {
-    if (compat_sys_call_table) return fp_unwrap_syscalln(nr, 1, before, after);
-    return inline_unwrap_syscalln(nr, 1, before, after);
+    hook_err_t rc = unhook_compat_syscalln_checked(nr, before, after);
+    if (rc) logke("compat syscall unhook deferred/failed rc=%d\n", rc);
 }
 KP_EXPORT_SYMBOL(unhook_compat_syscalln);
 
 void syscall_init()
 {
+    for (int i = 0; i < SYSCALL_ROUTE_COUNT; i++) {
+        syscall_hook_route_reset(&syscall_routes[i]);
+        syscall_hook_route_reset(&compat_syscall_routes[i]);
+    }
+
     for (int i = 0; i < sizeof(syscall_name_table) / sizeof(syscall_name_table[0]); i++) {
         uintptr_t *addr = (uintptr_t *)&syscall_name_table[i].name;
         *addr = link2runtime(*addr);

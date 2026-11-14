@@ -13,6 +13,8 @@
 #include <uapi/asm-generic/unistd.h>
 
 extern int has_syscall_wrapper;
+extern uintptr_t *sys_call_table;
+extern uintptr_t *compat_sys_call_table;
 extern struct
 {
     const char *name;
@@ -92,6 +94,8 @@ hook_err_t fp_wrap_syscalln(int nr, int narg, int is_compat, void *before, void 
  * @param after 
  */
 void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after);
+hook_err_t fp_unwrap_syscalln_checked(int nr, int is_compat, void *before,
+                                      void *after);
 
 static inline hook_err_t fp_hook_syscalln(int nr, int narg, void *before, void *after, void *udata)
 {
@@ -135,6 +139,8 @@ hook_err_t inline_wrap_syscalln(int nr, int narg, int is_compat, void *before, v
  * @param after 
  */
 void inline_unwrap_syscalln(int nr, int is_compat, void *before, void *after);
+hook_err_t inline_unwrap_syscalln_checked(int nr, int is_compat, void *before,
+                                          void *after);
 
 static inline hook_err_t inline_hook_syscalln(int nr, int narg, void *before, void *after, void *udata)
 {
@@ -161,9 +167,11 @@ static inline void inline_unhook_compat_syscalln(int nr, void *before, void *aft
 hook_err_t hook_syscalln(int nr, int narg, void *before, void *after, void *udata);
 
 void unhook_syscalln(int nr, void *before, void *after);
+hook_err_t unhook_syscalln_checked(int nr, void *before, void *after);
 
 hook_err_t hook_compat_syscalln(int nr, int narg, void *before, void *after, void *udata);
 
 void unhook_compat_syscalln(int nr, void *before, void *after);
+hook_err_t unhook_compat_syscalln_checked(int nr, void *before, void *after);
 
 #endif

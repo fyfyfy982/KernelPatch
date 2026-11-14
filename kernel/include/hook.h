@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <log.h>
+#include <hook_lifecycle.h>
 
 #define HOOK_INTO_BRANCH_FUNC
 
@@ -20,7 +21,20 @@ typedef enum
     HOOK_BAD_RELO = 4092,
     HOOK_TRANSIT_NO_MEM = 4091,
     HOOK_CHAIN_FULL = 4090,
+    HOOK_NOT_FOUND = 4089,
+    HOOK_GRACE_UNAVAILABLE = 4088,
+    HOOK_READER_BUSY = 4087,
+    HOOK_DEFERRED = 4086,
+    HOOK_WRONG_TYPE = 4085,
+    HOOK_BAD_CONTEXT = 4084,
 } hook_err_t;
+
+/* Hook installation, removal, and reactivation are process-context APIs.
+ * Callers must have IRQs and preemption enabled.  Checked entry points return
+ * -HOOK_BAD_CONTEXT otherwise; legacy void wrappers log and leave ownership
+ * unchanged.  Callback removal may return -HOOK_DEFERRED after publishing the
+ * item BUSY.  The caller must retain its module text and retry from process
+ * context after the active callback returns. */
 
 enum hook_type
 {
@@ -32,10 +46,6 @@ enum hook_type
 
 typedef int8_t chain_item_state;
 
-#define CHAIN_ITEM_STATE_EMPTY 0
-#define CHAIN_ITEM_STATE_READY 1
-#define CHAIN_ITEM_STATE_BUSY 2
-
 #define local_offsetof(TYPE, MEMBER) ((size_t) & ((TYPE *)0)->MEMBER)
 #define local_container_of(ptr, type, member) ({ (type *)((char *)(ptr) - local_offsetof(type, member)); })
 
@@ -44,7 +54,7 @@ typedef int8_t chain_item_state;
 #define RELOCATE_INST_NUM (TRAMPOLINE_NUM * 8 + 8)
 
 #define HOOK_CHAIN_NUM 0x10
-#define TRANSIT_INST_NUM 0x60
+#define TRANSIT_INST_NUM 0x100
 
 #define FP_HOOK_CHAIN_NUM 0x20
 
@@ -52,6 +62,10 @@ typedef int8_t chain_item_state;
 #define ARM64_BTI_C 0xd503245f
 #define ARM64_BTI_J 0xd503249f
 #define ARM64_BTI_JC 0xd50324df
+
+#define CHAIN_INSTALL_RETIRED 0
+#define CHAIN_INSTALL_ACTIVE 1
+#define CHAIN_INSTALL_UPDATING 2
 
 typedef struct
 {
@@ -207,9 +221,14 @@ typedef struct _hook_chain
     hook_t hook;
     int32_t chain_items_max;
     chain_item_state states[HOOK_CHAIN_NUM];
+    volatile int32_t readers[HOOK_CHAIN_NUM];
+    uint8_t debt_counted[HOOK_CHAIN_NUM];
+    volatile int32_t *debt_ptr;
     void *udata[HOOK_CHAIN_NUM];
     void *befores[HOOK_CHAIN_NUM];
     void *afters[HOOK_CHAIN_NUM];
+    volatile int32_t installed;
+    volatile int32_t grace_complete;
     uint32_t transit[TRANSIT_INST_NUM];
 } hook_chain_t __attribute__((aligned(8)));
 
@@ -225,9 +244,14 @@ typedef struct _fphook_chain
     fp_hook_t hook;
     int32_t chain_items_max;
     chain_item_state states[FP_HOOK_CHAIN_NUM];
+    volatile int32_t readers[FP_HOOK_CHAIN_NUM];
+    uint8_t debt_counted[FP_HOOK_CHAIN_NUM];
+    volatile int32_t *debt_ptr;
     void *udata[FP_HOOK_CHAIN_NUM];
     void *befores[FP_HOOK_CHAIN_NUM];
     void *afters[FP_HOOK_CHAIN_NUM];
+    volatile int32_t installed;
+    volatile int32_t grace_complete;
     uint32_t transit[TRANSIT_INST_NUM];
 } fp_hook_chain_t __attribute__((aligned(8)));
 
@@ -267,6 +291,12 @@ hook_err_t hook(void *func, void *replace, void **backup);
  * @param func 
  */
 void unhook(void *func);
+hook_err_t unhook_checked(void *func);
+int hook_cleanup_pending(void);
+hook_err_t hook_cleanup_drain(void);
+int hook_management_context_ok(void);
+int hook_reactivation_grace(void);
+extern volatile int32_t hook_deferred_debt;
 
 /**
  * @brief 
@@ -286,6 +316,8 @@ hook_err_t hook_chain_add(hook_chain_t *chain, void *before, void *after, void *
  * @param after 
  */
 void hook_chain_remove(hook_chain_t *chain, void *before, void *after);
+hook_err_t hook_chain_remove_checked(hook_chain_t *chain, void *before,
+                                     void *after);
 
 /**
  * @brief Wrap a function with before and after function. 
@@ -313,6 +345,8 @@ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void 
  * @param remove 
  */
 void hook_unwrap_remove(void *func, void *before, void *after, int remove);
+hook_err_t hook_unwrap_remove_checked(void *func, void *before, void *after,
+                                      int remove);
 
 static inline void hook_unwrap(void *func, void *before, void *after)
 {
@@ -345,6 +379,7 @@ void fp_hook(uintptr_t fp_addr, void *replace, void **backup);
  * @param backup 
  */
 void fp_unhook(uintptr_t fp_addr, void *backup);
+hook_err_t fp_unhook_checked(uintptr_t fp_addr, void *backup);
 
 /**
  * @brief 
@@ -366,6 +401,8 @@ hook_err_t fp_hook_wrap(uintptr_t fp_addr, int32_t argno, void *before, void *af
  * @param after 
  */
 void fp_hook_unwrap(uintptr_t fp_addr, void *before, void *after);
+hook_err_t fp_hook_unwrap_checked(uintptr_t fp_addr, void *before,
+                                  void *after);
 
 /**
  * 
